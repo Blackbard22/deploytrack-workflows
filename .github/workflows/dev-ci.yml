@@ -1,0 +1,317 @@
+name: DeployTrack — Dev CI
+
+# Reusable, config-generic CI. Callers pass only stable App-baked inputs;
+# components and build paths come from the caller repo's .deploytrack.yaml.
+#
+#   jobs:
+#     ci:
+#       uses: Blackbard22/deploytrack-workflows/.github/workflows/dev-ci.yml@v1
+#       with:
+#         tracker_url: ${{ vars.TRACKER_URL }}
+#         project_id: ${{ vars.TRACKER_PROJECT_ID }}
+#         image_repo_prefix: ${{ vars.IMAGE_REPO_PREFIX }}
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      tracker_url:
+        description: DeployTrack API base URL
+        required: true
+        type: string
+      project_id:
+        description: DeployTrack project id
+        required: true
+        type: string
+      image_repo_prefix:
+        description: GHCR image prefix; each component appends -<image_suffix>
+        required: true
+        type: string
+      runner:
+        description: Runner label for the build matrix (Windows + Docker + PowerShell)
+        required: false
+        type: string
+        default: self-hosted
+      fail_lint:
+        description: Force lint failure (smoke-test failed deploy reporting)
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      CICD_WEBHOOK_SECRET:
+        required: true
+      GHCR_USERNAME:
+        required: true
+      GHCR_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      components: ${{ steps.parse.outputs.components }}
+      branches: ${{ steps.parse.outputs.branches }}
+    steps:
+      - name: Checkout caller
+        uses: actions/checkout@v4
+
+      - name: Checkout workflows scripts
+        if: hashFiles('scripts/resolve-config.sh') == ''
+        uses: actions/checkout@v4
+        with:
+          repository: Blackbard22/deploytrack-workflows
+          path: _deploytrack_workflows
+          sparse-checkout: |
+            scripts
+          sparse-checkout-cone-mode: true
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.6/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Parse .deploytrack.yaml
+        id: parse
+        run: |
+          SCRIPT=scripts/resolve-config.sh
+          if [ ! -f "$SCRIPT" ]; then
+            SCRIPT=_deploytrack_workflows/scripts/resolve-config.sh
+          fi
+          chmod +x "$SCRIPT"
+          "$SCRIPT"
+
+  build:
+    needs: setup
+    runs-on: ${{ inputs.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJson(needs.setup.outputs.components) }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Allocate build in DeployTrack
+        id: allocate
+        env:
+          TRACKER_URL: ${{ inputs.tracker_url }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+          PROJECT_ID: ${{ inputs.project_id }}
+          IMAGE_REPO_PREFIX: ${{ inputs.image_repo_prefix }}
+          COMPONENT_NAME: ${{ matrix.component.name }}
+          COMPONENT_IMAGE_SUFFIX: ${{ matrix.component.image_suffix }}
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $utf8 = New-Object System.Text.UTF8Encoding $false
+          function Add-RunnerEnv([string]$Line) {
+            [System.IO.File]::AppendAllText($env:GITHUB_ENV, $Line + [Environment]::NewLine, $utf8)
+          }
+
+          $imageRepo = "$($env:IMAGE_REPO_PREFIX)-$($env:COMPONENT_IMAGE_SUFFIX)"
+          $body = @{
+            project_id       = [int]$env:PROJECT_ID
+            commit_sha       = $env:COMMIT_SHA
+            branch           = $env:BRANCH
+            image_repository = $imageRepo
+            component        = $env:COMPONENT_NAME
+          } | ConvertTo-Json -Compress
+
+          $headers = @{ 'Content-Type' = 'application/json' }
+          if ($env:TRACKER_TOKEN) {
+            $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)"
+          }
+
+          $resp = Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)/api/builds" -Headers $headers -Body $body
+          $resp | ConvertTo-Json -Depth 6
+
+          $buildId = [string]$resp.build.id
+          $version = [string]$resp.version
+          $buildNumber = [string]$resp.build_number
+          $dockerImage = [string]$resp.'docker_image'
+          if (-not $dockerImage -and $resp.build) {
+            $dockerImage = [string]$resp.build.'docker_image'
+          }
+          if ([string]::IsNullOrWhiteSpace($buildId)) { throw 'allocate response missing build.id' }
+          if ([string]::IsNullOrWhiteSpace($dockerImage)) { throw 'allocate response missing docker_image' }
+
+          Add-RunnerEnv "BUILD_ID=$buildId"
+          Add-RunnerEnv "VERSION=$version"
+          Add-RunnerEnv "BUILD_NUMBER=$buildNumber"
+          Add-RunnerEnv "DOCKER_IMAGE=$dockerImage"
+          $env:BUILD_ID = $buildId
+          $env:VERSION = $version
+          $env:BUILD_NUMBER = $buildNumber
+          $env:DOCKER_IMAGE = $dockerImage
+
+          Write-Host "Allocated $($env:COMPONENT_NAME) build:"
+          Write-Host "  build_id=$buildId"
+          Write-Host "  docker_image=$dockerImage"
+
+      - name: Optional intentional lint failure
+        if: ${{ inputs.fail_lint == true }}
+        run: |
+          Write-Error "Intentional lint failure (fail_lint=true)"
+          exit 1
+
+      - name: Run repo lint scripts
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lintDir = Join-Path $PWD 'ci/lint'
+          $scripts = @()
+          if (Test-Path $lintDir) {
+            $scripts = @(Get-ChildItem -Path $lintDir -File -Filter '*.ps1' |
+              Where-Object { $_.Name -notlike '*.disabled' } |
+              Sort-Object Name)
+          }
+          if ($scripts.Count -gt 0) {
+            foreach ($script in $scripts) {
+              Write-Host ('=== Running ' + $script.Name + ' ===')
+              & $script.FullName
+              if ($LASTEXITCODE -ne 0) { throw ('Lint failed: ' + $script.Name) }
+            }
+          } else {
+            Write-Host 'ci/lint empty or missing — skipping lint'
+          }
+
+      - name: Report failed dev deployment (lint)
+        if: failure() && steps.allocate.outcome == 'success'
+        env:
+          TRACKER_URL: ${{ inputs.tracker_url }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:BUILD_ID) { throw 'BUILD_ID missing after allocate' }
+          $headers = @{ 'Content-Type' = 'application/json' }
+          if ($env:TRACKER_TOKEN) {
+            $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)"
+          }
+          $failBody = @{
+            build_id    = [int]$env:BUILD_ID
+            environment = 'dev'
+            status      = 'failed'
+            deployed_by = 'github-actions'
+          } | ConvertTo-Json -Compress
+          try {
+            Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)/api/deployments" -Headers $headers -Body $failBody | Out-Null
+          } catch {
+            Write-Warning "Failed to report failed lint deploy: $_"
+          }
+
+      - name: Login to GHCR
+        env:
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $utf8 = New-Object System.Text.UTF8Encoding $false
+          $user = [string]$env:GHCR_USERNAME
+          $token = [string]$env:GHCR_TOKEN
+          if ([string]::IsNullOrWhiteSpace($user)) { throw 'GHCR_USERNAME secret is empty' }
+          if ([string]::IsNullOrWhiteSpace($token)) { throw 'GHCR_TOKEN secret is empty' }
+          $user = $user.Trim()
+          $token = $token.Trim()
+          $cfg = Join-Path $env:RUNNER_TEMP 'docker-config'
+          New-Item -ItemType Directory -Force -Path $cfg | Out-Null
+          Set-Content -Path (Join-Path $cfg 'config.json') -Value '{}'
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "DOCKER_CONFIG=$cfg" + [Environment]::NewLine, $utf8)
+          $env:DOCKER_CONFIG = $cfg
+          $patFile = Join-Path $env:RUNNER_TEMP 'ghcr.pat'
+          [System.IO.File]::WriteAllText($patFile, $token)
+          try {
+            cmd /c "docker login ghcr.io -u `"$user`" --password-stdin < `"$patFile`""
+            if ($LASTEXITCODE -ne 0) { throw 'docker login ghcr.io failed' }
+          } finally {
+            Remove-Item -Force $patFile -ErrorAction SilentlyContinue
+          }
+
+      - name: Build and push image
+        id: push
+        env:
+          TRACKER_URL: ${{ inputs.tracker_url }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+          COMPONENT_NAME: ${{ matrix.component.name }}
+          COMPONENT_PATH: ${{ matrix.component.path }}
+          COMPONENT_DOCKERFILE: ${{ matrix.component.dockerfile }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:BUILD_ID) { throw 'BUILD_ID is empty after allocate' }
+          if (-not $env:DOCKER_IMAGE) { throw 'DOCKER_IMAGE is empty after allocate' }
+
+          $context = $env:COMPONENT_PATH
+          $dockerfile = Join-Path $context $env:COMPONENT_DOCKERFILE
+          if (-not (Test-Path $context)) { throw "build context not found: $context" }
+          if (-not (Test-Path $dockerfile)) { throw "Dockerfile not found: $dockerfile" }
+
+          Write-Host "Building $($env:COMPONENT_NAME) image $($env:DOCKER_IMAGE) from $context (dockerfile=$dockerfile) for build_id=$($env:BUILD_ID)"
+          try {
+            docker build -f $dockerfile -t "$env:DOCKER_IMAGE" $context
+            if ($LASTEXITCODE -ne 0) { throw "$($env:COMPONENT_NAME) docker build failed" }
+            docker push "$env:DOCKER_IMAGE"
+            if ($LASTEXITCODE -ne 0) { throw "$($env:COMPONENT_NAME) docker push failed" }
+          } catch {
+            $headers = @{ 'Content-Type' = 'application/json' }
+            if ($env:TRACKER_TOKEN) { $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)" }
+            $failBody = @{
+              build_id    = [int]$env:BUILD_ID
+              environment = 'dev'
+              status      = 'failed'
+              deployed_by = 'github-actions'
+            } | ConvertTo-Json -Compress
+            try {
+              Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)/api/deployments" -Headers $headers -Body $failBody | Out-Null
+            } catch {
+              Write-Warning "Failed to report failed deploy: $_"
+            }
+            throw
+          }
+
+      - name: Record successful dev deployment
+        env:
+          TRACKER_URL: ${{ inputs.tracker_url }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $utf8 = New-Object System.Text.UTF8Encoding $false
+          $body = @{
+            build_id    = [int]$env:BUILD_ID
+            environment = 'dev'
+            status      = 'success'
+            deployed_by = 'github-actions'
+          } | ConvertTo-Json -Compress
+
+          $headers = @{ 'Content-Type' = 'application/json' }
+          if ($env:TRACKER_TOKEN) {
+            $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)"
+          }
+
+          $resp = Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)/api/deployments" -Headers $headers -Body $body
+          $resp | ConvertTo-Json -Depth 6
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "DEPLOYMENT_ID=$($resp.id)" + [Environment]::NewLine, $utf8)
+          $env:DEPLOYMENT_ID = [string]$resp.id
+
+      - name: Summary
+        env:
+          COMPONENT_NAME: ${{ matrix.component.name }}
+        run: |
+          @"
+          ### DeployTrack (dev CI — $($env:COMPONENT_NAME))
+          - **Version:** $env:VERSION-build$env:BUILD_NUMBER
+          - **Image:** ``$env:DOCKER_IMAGE``
+          - **build_id:** $env:BUILD_ID
+          - **deployment_id:** $env:DEPLOYMENT_ID
+          "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY
