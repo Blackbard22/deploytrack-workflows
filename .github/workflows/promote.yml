@@ -1,0 +1,334 @@
+name: DeployTrack — Promote
+
+# Reusable promote: retag one build_id to an environment (no rebuild).
+# Target must appear in resolved branches and must not be index 0 (CI branch).
+#
+#   jobs:
+#     promote:
+#       uses: Blackbard22/deploytrack-workflows/.github/workflows/promote.yml@v1
+#       with:
+#         tracker_url: ${{ vars.TRACKER_URL }}
+#         project_id: ${{ vars.TRACKER_PROJECT_ID }}
+#         build_id: ${{ inputs.build_id }}
+#         environment: ${{ inputs.environment }}
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      tracker_url:
+        description: DeployTrack API base URL
+        required: true
+        type: string
+      project_id:
+        description: DeployTrack project id
+        required: true
+        type: string
+      build_id:
+        description: DeployTrack build_id to promote
+        required: true
+        type: string
+      environment:
+        description: Target environment / branch (e.g. staging, production)
+        required: true
+        type: string
+      runner:
+        description: Runner label (Windows + Docker + PowerShell)
+        required: false
+        type: string
+        default: self-hosted
+    secrets:
+      CICD_WEBHOOK_SECRET:
+        required: true
+      GHCR_USERNAME:
+        required: true
+      GHCR_TOKEN:
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      should_promote: ${{ steps.guard.outputs.should_promote }}
+      predecessor: ${{ steps.guard.outputs.predecessor }}
+      branches: ${{ steps.parse.outputs.branches }}
+    steps:
+      - name: Checkout caller
+        uses: actions/checkout@v4
+
+      - name: Checkout workflows scripts
+        if: hashFiles('scripts/resolve-config.sh') == ''
+        uses: actions/checkout@v4
+        with:
+          repository: Blackbard22/deploytrack-workflows
+          path: _deploytrack_workflows
+          sparse-checkout: |
+            scripts
+          sparse-checkout-cone-mode: true
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.6/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Parse .deploytrack.yaml
+        id: parse
+        run: |
+          SCRIPT=scripts/resolve-config.sh
+          if [ ! -f "$SCRIPT" ]; then
+            SCRIPT=_deploytrack_workflows/scripts/resolve-config.sh
+          fi
+          chmod +x "$SCRIPT"
+          "$SCRIPT"
+
+      - name: Guard environment against branches
+        id: guard
+        env:
+          TARGET_ENV: ${{ inputs.environment }}
+          BRANCHES: ${{ steps.parse.outputs.branches }}
+        run: |
+          set -euo pipefail
+          TARGET="$(printf '%s' "$TARGET_ENV" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          echo "resolved branches=$BRANCHES target=$TARGET" >&2
+
+          should_promote=false
+          predecessor=""
+          i=0
+          found=false
+          while IFS= read -r b; do
+            bl="$(printf '%s' "$b" | tr '[:upper:]' '[:lower:]')"
+            if [[ "$bl" == "$TARGET" ]]; then
+              found=true
+              if [[ "$i" -gt 0 ]]; then
+                should_promote=true
+                predecessor="$(printf '%s' "$BRANCHES" | yq -r ".[$((i - 1))]")"
+              else
+                echo "Target '$TARGET' is the CI branch (branches index 0) — no-op" >&2
+              fi
+              break
+            fi
+            i=$((i + 1))
+          done < <(printf '%s' "$BRANCHES" | yq -r '.[]')
+
+          if [[ "$found" != true ]]; then
+            echo "Target '$TARGET' is not in branches=$BRANCHES — no-op" >&2
+          fi
+
+          {
+            echo "should_promote=$should_promote"
+            echo "predecessor=$predecessor"
+          } >> "$GITHUB_OUTPUT"
+
+  promote:
+    needs: setup
+    if: needs.setup.outputs.should_promote == 'true'
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Resolve build image
+        id: resolve
+        env:
+          TRACKER_URL: ${{ inputs.tracker_url }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+          BUILD_ID: ${{ inputs.build_id }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $utf8 = New-Object System.Text.UTF8Encoding $false
+          if (-not $env:BUILD_ID) { throw 'build_id input is required' }
+          if (-not $env:ENVIRONMENT) { throw 'environment input is required' }
+
+          $headers = @{ 'Content-Type' = 'application/json' }
+          if ($env:TRACKER_TOKEN) {
+            $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)"
+          }
+
+          $build = Invoke-RestMethod -Method GET -Uri "$($env:TRACKER_URL)/api/builds/$($env:BUILD_ID)" -Headers $headers
+          $dockerImage = [string]$build.docker_image
+          if (-not $dockerImage -and $build.build) {
+            $dockerImage = [string]$build.build.docker_image
+          }
+          if ([string]::IsNullOrWhiteSpace($dockerImage)) { throw 'build has no docker_image' }
+          $parts = $dockerImage -split ':', 2
+          $envName = $env:ENVIRONMENT.Trim().ToLowerInvariant()
+          $envTag = "$($parts[0]):$envName"
+
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "docker_image=$dockerImage" + [Environment]::NewLine, $utf8)
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "env_tag=$envTag" + [Environment]::NewLine, $utf8)
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "version=$($build.version)" + [Environment]::NewLine, $utf8)
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "component=$($build.component)" + [Environment]::NewLine, $utf8)
+          Write-Host "Promote build $($env:BUILD_ID) component=$($build.component) $dockerImage -> $envTag"
+
+      - name: Login to GHCR
+        env:
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $utf8 = New-Object System.Text.UTF8Encoding $false
+          $user = [string]$env:GHCR_USERNAME
+          $token = [string]$env:GHCR_TOKEN
+          if ([string]::IsNullOrWhiteSpace($user)) { throw 'GHCR_USERNAME secret is empty' }
+          if ([string]::IsNullOrWhiteSpace($token)) { throw 'GHCR_TOKEN secret is empty' }
+          $user = $user.Trim()
+          $token = $token.Trim()
+          $cfg = Join-Path $env:RUNNER_TEMP 'docker-config'
+          New-Item -ItemType Directory -Force -Path $cfg | Out-Null
+          Set-Content -Path (Join-Path $cfg 'config.json') -Value '{}'
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "DOCKER_CONFIG=$cfg" + [Environment]::NewLine, $utf8)
+          $env:DOCKER_CONFIG = $cfg
+          $patFile = Join-Path $env:RUNNER_TEMP 'ghcr.pat'
+          [System.IO.File]::WriteAllText($patFile, $token)
+          try {
+            cmd /c "docker login ghcr.io -u `"$user`" --password-stdin < `"$patFile`""
+            if ($LASTEXITCODE -ne 0) { throw 'docker login ghcr.io failed' }
+          } finally {
+            Remove-Item -Force $patFile -ErrorAction SilentlyContinue
+          }
+
+      - name: Retag image for environment
+        id: retag
+        env:
+          DOCKER_IMAGE: ${{ steps.resolve.outputs.docker_image }}
+          ENV_TAG: ${{ steps.resolve.outputs.env_tag }}
+          BUILD_ID: ${{ inputs.build_id }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          TRACKER_URL: ${{ inputs.tracker_url }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Report-Failed {
+            $headers = @{ 'Content-Type' = 'application/json' }
+            if ($env:TRACKER_TOKEN) { $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)" }
+            $body = @{
+              build_id    = [int]$env:BUILD_ID
+              environment = $env:ENVIRONMENT.Trim().ToLowerInvariant()
+              status      = 'failed'
+              deployed_by = 'github-actions'
+            } | ConvertTo-Json -Compress
+            try {
+              Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)/api/deployments" -Headers $headers -Body $body | Out-Null
+            } catch {
+              Write-Warning "Failed to report failed $($env:ENVIRONMENT) deploy: $_"
+            }
+          }
+          try {
+            docker pull $env:DOCKER_IMAGE
+            if ($LASTEXITCODE -ne 0) { throw "pull $($env:DOCKER_IMAGE) failed" }
+            docker tag $env:DOCKER_IMAGE $env:ENV_TAG
+            docker push $env:ENV_TAG
+            if ($LASTEXITCODE -ne 0) { throw "push $($env:ENV_TAG) failed" }
+          } catch {
+            Report-Failed
+            throw
+          }
+
+      - name: Record gated promote
+        id: promote
+        env:
+          TRACKER_URL: ${{ inputs.tracker_url }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+          BUILD_ID: ${{ inputs.build_id }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $utf8 = New-Object System.Text.UTF8Encoding $false
+          $envName = $env:ENVIRONMENT.Trim().ToLowerInvariant()
+          $body = @{
+            target_environment = $envName
+            deployed_by        = 'github-actions'
+          } | ConvertTo-Json -Compress
+
+          $headers = @{ 'Content-Type' = 'application/json' }
+          if ($env:TRACKER_TOKEN) {
+            $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)"
+          }
+
+          $uri = "$($env:TRACKER_URL)/api/builds/$($env:BUILD_ID)/promote"
+          $resp = Invoke-RestMethod -Method POST -Uri $uri -Headers $headers -Body $body
+          $resp | ConvertTo-Json -Depth 6
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "deployment_id=$($resp.id)" + [Environment]::NewLine, $utf8)
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "status=$($resp.status)" + [Environment]::NewLine, $utf8)
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync environment branch to predecessor
+        id: git_sync
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          PREDECESSOR: ${{ needs.setup.outputs.predecessor }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $utf8 = New-Object System.Text.UTF8Encoding $false
+          $envName = $env:ENVIRONMENT.Trim()
+          $pred = $env:PREDECESSOR.Trim()
+          if ([string]::IsNullOrWhiteSpace($envName)) { throw 'environment is empty' }
+          if ([string]::IsNullOrWhiteSpace($pred)) { throw 'predecessor is empty' }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin $pred
+          $remoteEnv = git ls-remote --heads origin $envName
+
+          if ($remoteEnv) {
+            git fetch origin $envName
+            git checkout -B $envName origin/$envName
+            git merge --ff-only origin/$pred
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "Fast-forward not possible; aligning $envName tip to origin/$pred"
+              git reset --hard origin/$pred
+              if ($LASTEXITCODE -ne 0) { throw "git reset --hard origin/$pred failed" }
+              git push --force-with-lease origin HEAD:$envName
+              if ($LASTEXITCODE -ne 0) { throw "git push --force-with-lease to $envName failed" }
+              [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "sync_mode=reset" + [Environment]::NewLine, $utf8)
+            } else {
+              git push origin HEAD:$envName
+              if ($LASTEXITCODE -ne 0) { throw "git push to $envName failed" }
+              [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "sync_mode=fast-forward" + [Environment]::NewLine, $utf8)
+            }
+          } else {
+            git checkout -B $envName origin/$pred
+            git push -u origin HEAD:$envName
+            if ($LASTEXITCODE -ne 0) { throw "git push creating $envName failed" }
+            [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "sync_mode=created" + [Environment]::NewLine, $utf8)
+          }
+
+          $sha = (git rev-parse HEAD).Trim()
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "env_sha=$sha" + [Environment]::NewLine, $utf8)
+
+      - name: Summary
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          PREDECESSOR: ${{ needs.setup.outputs.predecessor }}
+          DEPLOYMENT_ID: ${{ steps.promote.outputs.deployment_id }}
+          STATUS: ${{ steps.promote.outputs.status }}
+          ENV_TAG: ${{ steps.resolve.outputs.env_tag }}
+          ENV_SHA: ${{ steps.git_sync.outputs.env_sha }}
+          SYNC_MODE: ${{ steps.git_sync.outputs.sync_mode }}
+        run: |
+          @"
+          ### DeployTrack (promote — $($env:PREDECESSOR) → $($env:ENVIRONMENT))
+          - **build_id:** $env:BUILD_ID
+          - **deployment_id:** $env:DEPLOYMENT_ID
+          - **status:** $env:STATUS
+          - **Env tag:** ``$env:ENV_TAG``
+          - **Git $($env:ENVIRONMENT) SHA:** ``$env:ENV_SHA``
+          - **Git sync:** $env:SYNC_MODE
+          "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY
