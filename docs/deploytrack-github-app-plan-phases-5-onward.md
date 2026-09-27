@@ -246,6 +246,50 @@ Goal: move from test account to the real org, migrate existing repos, and retire
 
 
 
+## Phase 12 — Webhook delivery recovery
+
+Goal: make sure no GitHub event is permanently lost when the App can't accept it. GitHub does **not** retry failed webhook deliveries automatically, but it keeps a log of every App delivery for **3 days** and lets you redeliver from it via the API. This phase makes `ReconcileJob` use that log, and makes the receiver safe to hit with the same event more than once.
+
+Background: the receiver acknowledges an event (2xx) only once it's safely stored as a River job. If the backend is down but Postgres is up, the job is stored and River retries it, so no recovery is needed. Recovery is needed when the event never got stored: Postgres down (receiver returns 500, `receiver.go:58`) or the App down or unreachable. In both cases GitHub records the delivery as failed.
+
+Reference: [Handling failed webhook deliveries](https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries), [REST API endpoints for GitHub App webhooks](https://docs.github.com/en/rest/apps/webhooks), [Redelivering webhooks](https://docs.github.com/en/webhooks/testing-and-troubleshooting-webhooks/redelivering-webhooks) (the 3-day window).
+
+**12.1 — Redeliver failed deliveries from `ReconcileJob`**
+
+- [ ] Run often, e.g. every 5–15 minutes, well inside the 3-day window
+- [ ] Keep a cursor (the last delivery ID you've checked) in a small table
+- [ ] Use the App JWT (`internal/githubauth/appauth.go`; installation tokens are not accepted) to page through `GET /app/hook/deliveries` from that cursor
+- [ ] Pick out the deliveries that failed, grouped by the delivery ID GitHub sends in the `X-GitHub-Delivery` header. A redelivery keeps the same ID, so skip any ID where a later attempt succeeded. Otherwise you'd redeliver something twice. Check this grouping against the actual API response before relying on it
+- [ ] Call `POST /app/hook/deliveries/{delivery_id}/attempts` for each one that still needs it
+- [ ] Fix the stale comment in `receiver.go` ("GitHub will redeliver on failure"); GitHub doesn't, this job does
+
+**12.2 — Deduplicate in the receiver by delivery ID**
+
+- [ ] Read the delivery ID in the receiver (`github.DeliveryID(r)`) and pass it into the job args
+- [ ] Use it as River's uniqueness key (``DeliveryID string `river:"unique"` ``) for jobs where each event is distinct: `RenameRepoArgs`, `SyncInstallationArgs`, and future `workflow_run` / `deployment_status` jobs. A redelivery that arrives after all (or after a manual click in the GitHub UI) then becomes a no-op
+- [ ] This also fixes a current bug: those jobs are unique on `repo_id` / `installation_id + action`, so a genuine second rename, or suspend → unsuspend → suspend, arriving while the first job is still retained is dropped as a duplicate
+- [ ] Keep `EnrollRepoArgs` unique on `repo_id`. Collapsing every trigger into one "make this repo enrolled" job is the intended behavior there
+- [ ] Confirm River's unique-state defaults and completed-job retention for the River version in use; the dedup window only lasts as long as completed jobs are retained (about 24h by default)
+
+**12.3 — Make job effects safe to repeat and to reorder**
+
+The delivery ID doesn't cover everything: redeliveries after the retention window, backfilled events (which have no delivery ID), and old events arriving after newer ones.
+
+- [ ] Backend writes upsert on natural keys: `repo_id` for projects and enrollments (already in place), `run_id + run_attempt + component` for builds and deployments
+- [ ] Treat the webhook as a signal and read the current state from GitHub: `RenameRepoJob` fetches the repo's current name by `repo_id` rather than trusting the payload; the installation job fetches the current suspended status
+
+**12.4 — Backfill for outages longer than 3 days**
+
+- [ ] For outages longer than 3 days, fall back to a workflow-runs backfill: list runs per enrolled repo since the cursor and upsert them through the same natural keys as 12.3. Workflow runs are kept far longer than webhook deliveries
+
+**Checkpoint:** with the App stopped, trigger a repo rename and a CI run on a test repo, then restart the App. Within one reconcile interval both events are redelivered and processed, the delivery log shows the redelivered attempts as successful, and nothing is duplicated. Manually clicking "Redeliver" on an already-processed delivery changes nothing. Two genuine renames of the same repo in a row both land, and the tracker shows the final name.
+
+**Dependency note:** this builds on Phase 9's `ReconcileJob` wiring and needs its body implemented (still a TODO in `reconcile.go`). Although numbered after rollout, land it before Phase 11 onboards the org: without it, every App or Postgres outage needs manual redelivery across many repos.
+
+---
+
+
+
 ## Post-launch backlog (deferred, not blocking)
 
 Deliberately out of the core project scope, worth tracking for later:
