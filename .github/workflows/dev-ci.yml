@@ -40,10 +40,6 @@ on:
     secrets:
       CICD_WEBHOOK_SECRET:
         required: true
-      GHCR_USERNAME:
-        required: true
-      GHCR_TOKEN:
-        required: true
 
 permissions:
   contents: read
@@ -214,15 +210,15 @@ jobs:
 
       - name: Login to GHCR
         env:
-          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
           $utf8 = New-Object System.Text.UTF8Encoding $false
           $user = [string]$env:GHCR_USERNAME
           $token = [string]$env:GHCR_TOKEN
-          if ([string]::IsNullOrWhiteSpace($user)) { throw 'GHCR_USERNAME secret is empty' }
-          if ([string]::IsNullOrWhiteSpace($token)) { throw 'GHCR_TOKEN secret is empty' }
+          if ([string]::IsNullOrWhiteSpace($user)) { throw 'github.actor is empty' }
+          if ([string]::IsNullOrWhiteSpace($token)) { throw 'GITHUB_TOKEN is empty; the caller must grant packages: write' }
           $user = $user.Trim()
           $token = $token.Trim()
           $cfg = Join-Path $env:RUNNER_TEMP 'docker-config'
