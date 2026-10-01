@@ -25,9 +25,13 @@ components:
     path: ./backend
   - name: frontend
     path: ./frontend
+
+approvals:
+  dev: qa
+  staging: client
 ```
 
-`dockerfile` and `image_suffix` may be omitted; they default to `Dockerfile` and `name`.
+`dockerfile` and `image_suffix` may be omitted; they default to `Dockerfile` and `name`. `approvals` may be omitted; see [Approval gates](#approval-gates) for the defaults.
 
 Infer from Compose (same resolution as a missing `components` list):
 
@@ -57,6 +61,7 @@ components:
 | `components[].path` | string | no | Build context. Default `.`. |
 | `components[].dockerfile` | string | no | Default `Dockerfile`. Relative to `path` (`path: ./backend` + `dockerfile: Dockerfile` → `./backend/Dockerfile`). CI: `docker build -f {path}/{dockerfile} {path}`. |
 | `components[].image_suffix` | string | no | Default = `name` (after name is resolved). |
+| `approvals` | mapping of branch → `qa` \| `client` \| `none` | no | Approval gate per pipeline stage. If present and non-empty, **replaces** the default gates (see [Approval gates](#approval-gates)). Read by the App only; the workflows ignore it. |
 
 `image_repo_prefix` is not a field in this file. The App writes it as a repo variable at enrollment (`IMAGE_REPO_PREFIX`, typically `ghcr.io/<owner>/<repo>`); callers pass it into the reusable workflow. Images are always `{image_repo_prefix}-{image_suffix}`.
 
@@ -129,6 +134,48 @@ Do not combine `infer: true` with a component list. If both appear, `infer: true
 
 ---
 
+## Approval gates
+
+Each entry in `branches` is a pipeline stage (a DeployTrack environment, named after the branch in lower case). A stage can carry one approval gate, owned by a role: `qa` or `client`.
+
+**The source stage owns the gate.** A gate on stage X means the build's successful deploy in X must be approved by that role before the build can be promoted to the next stage. Rejecting it stops the build. CI deploys to the first stage are never gated; the first stage's gate guards the hop out of it.
+
+```yaml
+branches: [dev, staging, production]
+approvals:
+  dev: qa          # QA approves the dev deploy before dev → staging
+  staging: client  # the client approves the staging deploy before staging → production
+```
+
+**Defaults** apply when `approvals` is omitted or empty. They depend on position in `branches`, not on branch names:
+
+| Stages | Default gates |
+|---|---|
+| 1 | none (CI only) |
+| 2, including the default `["dev", "production"]` | none |
+| 3 or more | `qa` on the first stage, `client` on the stage before the last, `qa` on every stage in between, none on the last |
+
+So `[dev, staging, production]` defaults to `dev: qa`, `staging: client`, and `[dev, test, uat, live]` to `dev: qa`, `test: qa`, `uat: client`.
+
+**Rules**
+
+- **Replace, don't merge.** A non-empty `approvals` map is the complete set of gates. Stages it does not list have no gate, whatever the defaults would have given them.
+- **`none`** means no gate. It is how a repo opts out of the defaults: `approvals: {dev: none}` on a three-stage pipeline leaves every hop ungated.
+- **Two stages are ungated unless you say otherwise.** Add `approvals: {dev: qa}` to gate `dev → production`.
+- **Keys** must be entries of the resolved `branches`; values must be `qa`, `client` or `none`. Both are case-insensitive. Anything else is a config error: enrollment or the config sync fails and the gates already registered stay in place.
+- **Last stage.** A gate on the last stage is accepted but blocks nothing, because there is no next stage. It is a sign-off record only.
+- **Who can promote.** Promoting out of a gated stage needs that stage's role on the project; promoting out of an ungated stage needs only project access.
+
+**Changing the file.** The App reads `.deploytrack.yaml` from the repo's **default branch**. It registers the pipeline at enrollment, and again on every push to the default branch that adds, edits or deletes the file (`SyncConfigJob`):
+
+- Changed gates apply to the next approval or promote; approvals already recorded are kept.
+- A branch added to `branches` is created from the default branch tip and becomes a tracker environment.
+- A branch removed from `branches` stops being a tracker environment. The git branch itself is left alone, and past deployments keep their environment name.
+- Deleting the file returns the repo to the default branches and the default gates.
+- Changing the first (CI) branch is not applied to the enrolled repo's caller workflow, which still triggers on the original branch; edit `.github/workflows/deploytrack.yml` by hand.
+
+---
+
 ## Compatibility
 
 | Workflow tag | Schema `version` |
@@ -139,4 +186,6 @@ Do not combine `infer: true` with a component list. If both appear, `infer: true
 
 ## Implementation status
 
-App and [`scripts/resolve-config.sh`](scripts/resolve-config.sh) implement Compose inference from the first repo-root Compose file (`docker-compose.yml` → `docker-compose.yaml` → `compose.yml` → `compose.yaml`). Missing yaml, empty or omitted components, and `components.infer: true` expand to the same explicit list (or the `app` fallback). App org defaults are `["dev", "production"]`. Reusable [`promote.yml`](.github/workflows/promote.yml) retags one `build_id` to an `environment` input; a missing or CI-only (index 0) target in `branches` is a no-op. Enrollment writes a thin `workflow_dispatch` caller so `trigger-promote` can dispatch it. `SyncConfigJob` is still a stub.
+App and [`scripts/resolve-config.sh`](scripts/resolve-config.sh) implement Compose inference from the first repo-root Compose file (`docker-compose.yml` → `docker-compose.yaml` → `compose.yml` → `compose.yaml`). Missing yaml, empty or omitted components, and `components.infer: true` expand to the same explicit list (or the `app` fallback). App org defaults are `["dev", "production"]`. Reusable [`promote.yml`](.github/workflows/promote.yml) retags one `build_id` to an `environment` input; a missing or CI-only (index 0) target in `branches` is a no-op. Enrollment writes a thin `workflow_dispatch` caller so `trigger-promote` can dispatch it.
+
+The App resolves `approvals` into per-stage gates (`ResolveEnvironments`) and sends them to the tracker as `environments` in `RegisterProject`; the tracker removes environments that are no longer listed. `SyncConfigJob` re-registers on pushes to the default branch that touch `.deploytrack.yaml`. `resolve-config.sh` and the reusable workflows ignore `approvals`; gates are enforced by the tracker when a promote is triggered or recorded.
