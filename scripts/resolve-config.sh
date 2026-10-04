@@ -6,7 +6,9 @@
 # Missing file, empty components, or components.infer: true → Compose inference
 # from the first file at repo root (cwd): docker-compose.yml, docker-compose.yaml,
 # compose.yml, compose.yaml. Services with build: become components; otherwise
-# a single app component at ".".
+# a single app component at ".", but only when ./Dockerfile exists. With no
+# Dockerfile there are no components ([]): a new or empty repo has nothing to
+# build yet. check-components.sh verifies the Dockerfiles of the result.
 
 set -euo pipefail
 
@@ -19,8 +21,13 @@ if ! command -v yq >/dev/null 2>&1; then
   exit 1
 fi
 
+# The root "app" component exists only when there is a root Dockerfile.
 app_fallback() {
-  echo "$APP_FALLBACK"
+  if [[ -f Dockerfile ]]; then
+    echo "$APP_FALLBACK"
+  else
+    echo "[]"
+  fi
 }
 
 # First Compose file at repo root wins; no merge.

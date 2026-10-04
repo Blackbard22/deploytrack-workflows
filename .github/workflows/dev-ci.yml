@@ -1,7 +1,16 @@
 name: DeployTrack — Dev CI
 
 # Reusable, config-generic CI. Callers pass only stable App-baked inputs;
-# components and build paths come from the caller repo's .deploytrack.yaml.
+# components and build paths come from the caller repo's .deploytrack.yaml,
+# its Compose file, or a root Dockerfile (see SPEC.md, "Components").
+#
+# Two stages:
+#   detect - resolve the components and check every Dockerfile exists. A
+#            declared component without its Dockerfile fails the run before
+#            anything is allocated. No components (new or empty repo) is a
+#            success with nothing to build.
+#   build  - one matrix leg per component; skipped when there are none.
+#            DeployTrack registers a component the first time it is built.
 #
 #   jobs:
 #     ci:
@@ -47,10 +56,11 @@ permissions:
   id-token: write
 
 jobs:
-  setup:
+  detect:
     runs-on: ubuntu-latest
     outputs:
-      components: ${{ steps.parse.outputs.components }}
+      components: ${{ steps.check.outputs.components }}
+      has_components: ${{ steps.check.outputs.has_components }}
       branches: ${{ steps.parse.outputs.branches }}
     steps:
       - name: Checkout caller
@@ -72,23 +82,40 @@ jobs:
           sudo chmod +x /usr/local/bin/yq
           yq --version
 
-      - name: Parse .deploytrack.yaml
+      - name: Resolve components
         id: parse
         run: |
-          SCRIPT=scripts/resolve-config.sh
-          if [ ! -f "$SCRIPT" ]; then
-            SCRIPT=_deploytrack_workflows/scripts/resolve-config.sh
+          SCRIPTS=scripts
+          if [ ! -f "$SCRIPTS/resolve-config.sh" ]; then
+            SCRIPTS=_deploytrack_workflows/scripts
           fi
-          chmod +x "$SCRIPT"
-          "$SCRIPT"
+          echo "SCRIPTS=$SCRIPTS" >> "$GITHUB_ENV"
+          bash "$SCRIPTS/resolve-config.sh"
+
+      - name: Check Dockerfiles
+        id: check
+        env:
+          COMPONENTS: ${{ steps.parse.outputs.components }}
+        run: bash "$SCRIPTS/check-components.sh"
+
+      - name: Summary (nothing to build)
+        if: steps.check.outputs.has_components != 'true'
+        run: |
+          {
+            echo "### DeployTrack (dev CI)"
+            echo "No buildable components yet, so nothing was built."
+            echo "Add a root \`Dockerfile\`, a Compose service with \`build:\`, or a component in \`.deploytrack.yaml\`."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
-    needs: setup
+    needs: detect
+    # GitHub rejects an empty matrix, so skip the job when there is nothing to build.
+    if: needs.detect.outputs.has_components == 'true'
     runs-on: ${{ inputs.runner }}
     strategy:
       fail-fast: false
       matrix:
-        component: ${{ fromJson(needs.setup.outputs.components) }}
+        component: ${{ fromJson(needs.detect.outputs.components) }}
     permissions:
       contents: read
       packages: write

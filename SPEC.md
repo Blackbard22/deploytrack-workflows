@@ -108,7 +108,7 @@ services:
 
 becomes two components: `api` (`./api` / `Dockerfile`) and `web` (`./frontend` / `Dockerfile.prod`). `db` is skipped.
 
-**If that yields nothing** (no Compose file, or no service with `build:`): one component
+**If that yields nothing** (no Compose file, or no service with `build:`): one component, **only if `./Dockerfile` exists**
 
 ```yaml
 name: app
@@ -116,6 +116,8 @@ path: .
 dockerfile: Dockerfile
 image_suffix: app
 ```
+
+With no root `Dockerfile` either, the repo has **no components**. That is a valid state, not an error: a new or empty repo has nothing to build yet (see [Detect and build](#detect-and-build)).
 
 Default `branches` when they are also omitted: `["dev", "production"]`. A file with `components.infer: true` can still set `branches` explicitly; only the component list is inferred.
 
@@ -131,6 +133,21 @@ Do not combine `infer: true` with a component list. If both appear, `infer: true
 - **Duplicate names allowed.** Two entries with the same `name` are two matrix legs that report the same tracker component name.
 - **Images.** `{image_repo_prefix}-{image_suffix}`.
 - **Pipeline.** `branches` order is the promotion pipeline. Index `0` is the CI/build branch; every later entry is a promote target. A one-element list is CI-only (no promote).
+
+---
+
+## Detect and build
+
+`dev-ci.yml` runs in two stages.
+
+**`detect`** resolves the components with the rules above (`scripts/resolve-config.sh`), then checks that each one can be built (`scripts/check-components.sh`): the build context `path` must be a directory and `{path}/{dockerfile}` must exist.
+
+- **A declared component without its Dockerfile fails the whole run.** This applies to components from `.deploytrack.yaml` and from Compose `build:` services. Every missing file is reported as an error, nothing is allocated in DeployTrack, and no component is built until it is fixed.
+- **No components is a success.** The run ends green with a summary saying there is nothing to build, and the `build` job is skipped.
+
+**`build`** runs one matrix leg per component, as before.
+
+**Registration.** DeployTrack registers a component the first time CI allocates a build for it, whichever branch it first appears on. The App also registers the components it resolves from the default branch at enrollment, on config sync and on reconcile. A project with no registered components shows "no buildable components" in DeployTrack.
 
 ---
 
@@ -186,6 +203,6 @@ So `[dev, staging, production]` defaults to `dev: qa`, `staging: client`, and `[
 
 ## Implementation status
 
-App and [`scripts/resolve-config.sh`](scripts/resolve-config.sh) implement Compose inference from the first repo-root Compose file (`docker-compose.yml` → `docker-compose.yaml` → `compose.yml` → `compose.yaml`). Missing yaml, empty or omitted components, and `components.infer: true` expand to the same explicit list (or the `app` fallback). App org defaults are `["dev", "production"]`. Reusable [`promote.yml`](.github/workflows/promote.yml) retags one `build_id` to an `environment` input; a missing or CI-only (index 0) target in `branches` is a no-op. Enrollment writes a thin `workflow_dispatch` caller so `trigger-promote` can dispatch it.
+App and [`scripts/resolve-config.sh`](scripts/resolve-config.sh) implement Compose inference from the first repo-root Compose file (`docker-compose.yml` → `docker-compose.yaml` → `compose.yml` → `compose.yaml`). Missing yaml, empty or omitted components, and `components.infer: true` expand to the same explicit list (or the `app` fallback when `./Dockerfile` exists, else no components). [`scripts/check-components.sh`](scripts/check-components.sh) is the `detect` job's Dockerfile check; both scripts are covered by `scripts/tests/run.sh`, which `test-scripts.yml` runs on changes. App org defaults are `["dev", "production"]`. Reusable [`promote.yml`](.github/workflows/promote.yml) retags one `build_id` to an `environment` input; a missing or CI-only (index 0) target in `branches` is a no-op. Enrollment writes a thin `workflow_dispatch` caller so `trigger-promote` can dispatch it.
 
 The App resolves `approvals` into per-stage gates (`ResolveEnvironments`) and sends them to the tracker as `environments` in `RegisterProject`; the tracker removes environments that are no longer listed. `SyncConfigJob` re-registers on pushes to the default branch that touch `.deploytrack.yaml`. `resolve-config.sh` and the reusable workflows ignore `approvals`; gates are enforced by the tracker when a promote is triggered or recorded.
