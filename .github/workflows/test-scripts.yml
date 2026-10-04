@@ -1,0 +1,32 @@
+name: Test scripts
+
+# Runs the detect-step script tests (resolve-config.sh + check-components.sh)
+# whenever the scripts change.
+
+on:
+  push:
+    paths:
+      - "scripts/**"
+      - ".github/workflows/test-scripts.yml"
+  pull_request:
+    paths:
+      - "scripts/**"
+      - ".github/workflows/test-scripts.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.6/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Run script tests
+        run: bash scripts/tests/run.sh
