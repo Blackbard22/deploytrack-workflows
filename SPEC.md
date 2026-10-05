@@ -62,6 +62,8 @@ components:
 | `components[].dockerfile` | string | no | Default `Dockerfile`. Relative to `path` (`path: ./backend` + `dockerfile: Dockerfile` → `./backend/Dockerfile`). CI: `docker build -f {path}/{dockerfile} {path}`. |
 | `components[].image_suffix` | string | no | Default = `name` (after name is resolved). |
 | `approvals` | mapping of branch → `qa` \| `client` \| `none` | no | Approval gate per pipeline stage. If present and non-empty, **replaces** the default gates (see [Approval gates](#approval-gates)). Read by the App only; the workflows ignore it. |
+| `build.shared_changes` | `all` \| `none` | no | Default `all`. What a change to files outside **every** component's `path` rebuilds: every component, or nothing. See [Detect and build](#detect-and-build). |
+| `build.ignore` | list of strings | no | Default `["*.md", "docs/", ".github/"]`. If present, **replaces** the default. Path patterns that never trigger a build; `*` matches any characters including `/`, and a pattern ending in `/` matches everything under that folder. |
 
 `image_repo_prefix` is not a field in this file. The App writes it as a repo variable at enrollment (`IMAGE_REPO_PREFIX`, typically `ghcr.io/<owner>/<repo>`); callers pass it into the reusable workflow. Images are always `{image_repo_prefix}-{image_suffix}`.
 
@@ -138,14 +140,49 @@ Do not combine `infer: true` with a component list. If both appear, `infer: true
 
 ## Detect and build
 
-`dev-ci.yml` runs in two stages.
+`dev-ci.yml` runs in three stages.
+
+**`baselines`** (on the build runner) asks DeployTrack, via `GET /api/projects/{id}/build-baselines`, which commit each component was last built from: its newest build with a successful deploy to the first pipeline stage. If the call fails, every component builds.
 
 **`detect`** resolves the components with the rules above (`scripts/resolve-config.sh`), then checks that each one can be built (`scripts/check-components.sh`): the build context `path` must be a directory and `{path}/{dockerfile}` must exist.
 
 - **A declared component without its Dockerfile fails the whole run.** This applies to components from `.deploytrack.yaml` and from Compose `build:` services. Every missing file is reported as an error, nothing is allocated in DeployTrack, and no component is built until it is fixed.
 - **No components is a success.** The run ends green with a summary saying there is nothing to build, and the `build` job is skipped.
 
-**`build`** runs one matrix leg per component, as before.
+Then `scripts/select-changed.sh` keeps only the components that need a build. It compares `git diff <baseline> HEAD`, minus `build.ignore`, with each component's `path`. A component builds when any of these is true:
+
+| Reason | Example |
+|---|---|
+| Its folder changed since its baseline | `frontend/src/app.ts` edited → `frontend` builds, `backend` does not |
+| A shared file changed and `build.shared_changes` is `all` (default) | `package-lock.json` at the root → every component builds |
+| It has never built, or its baseline commit is not in the history | first push, or after a force-push |
+| A new version was picked for it in DeployTrack | the Next release panel → that component builds even if unchanged |
+| It was forced | see below |
+
+A component with `path: .` owns the whole repo, so any non-ignored change builds it. Unchanged components are listed in the run summary with the commit they were last built from. Renames count for both the old and the new folder.
+
+**Forcing a build.** The caller's `workflow_dispatch` takes a `build` input, passed to `dev-ci.yml` as `force_components`: blank means changed components only, `all` builds everything, and a comma list (`frontend,backend`) builds those components as well as any that changed. DeployTrack's **Build** button dispatches the caller with that input (`POST /api/projects/{id}/builds/dispatch`). Callers enrolled before this input existed need it added to `.github/workflows/deploytrack.yml` by hand.
+
+**`build`** runs one matrix leg per selected component, as before.
+
+---
+
+## Production releases
+
+When `promote.yml` promotes a build to the **last** entry in `branches` (production), it also publishes a GitHub Release, so the repo's Releases page always shows what production runs (`scripts/publish-release.ps1`).
+
+| | Single-component repo | Repo with several components |
+|---|---|---|
+| Tag | `v1.4.0` | `backend-v1.4.0` |
+| Name | `1.4.0` | `backend 1.4.0` |
+
+- **Where the tag points:** the build's commit, not the tip of the environment branch.
+- **Notes:** the production image and environment tag, build number, commit, DeployTrack build id and a link to the promote run, followed by GitHub's generated notes since the previous tag of the same component.
+- **Latest:** every production promote marks its release Latest, so in a repo with several components the most recently promoted one is Latest.
+- **Same version again:** if a later build of the same version reaches production, the tag is moved to its commit and the notes gain a line saying production now runs that build. Re-running a promote changes nothing but the Latest flag.
+- **Failures don't undo the promote:** the image is already retagged and the deploy recorded. A Releases error shows as a warning in the run summary.
+
+The caller's `promote.yml` already grants `contents: write`, which this needs. Promotes to any earlier stage publish nothing.
 
 **Registration.** DeployTrack registers a component the first time CI allocates a build for it, whichever branch it first appears on. The App also registers the components it resolves from the default branch at enrollment, on config sync and on reconcile. A project with no registered components shows "no buildable components" in DeployTrack.
 
@@ -203,6 +240,6 @@ So `[dev, staging, production]` defaults to `dev: qa`, `staging: client`, and `[
 
 ## Implementation status
 
-App and [`scripts/resolve-config.sh`](scripts/resolve-config.sh) implement Compose inference from the first repo-root Compose file (`docker-compose.yml` → `docker-compose.yaml` → `compose.yml` → `compose.yaml`). Missing yaml, empty or omitted components, and `components.infer: true` expand to the same explicit list (or the `app` fallback when `./Dockerfile` exists, else no components). [`scripts/check-components.sh`](scripts/check-components.sh) is the `detect` job's Dockerfile check; both scripts are covered by `scripts/tests/run.sh`, which `test-scripts.yml` runs on changes. App org defaults are `["dev", "production"]`. Reusable [`promote.yml`](.github/workflows/promote.yml) retags one `build_id` to an `environment` input; a missing or CI-only (index 0) target in `branches` is a no-op. Enrollment writes a thin `workflow_dispatch` caller so `trigger-promote` can dispatch it.
+App and [`scripts/resolve-config.sh`](scripts/resolve-config.sh) implement Compose inference from the first repo-root Compose file (`docker-compose.yml` → `docker-compose.yaml` → `compose.yml` → `compose.yaml`). Missing yaml, empty or omitted components, and `components.infer: true` expand to the same explicit list (or the `app` fallback when `./Dockerfile` exists, else no components). [`scripts/check-components.sh`](scripts/check-components.sh) is the `detect` job's Dockerfile check; [`scripts/select-changed.sh`](scripts/select-changed.sh) picks the components that changed. All three are covered by `scripts/tests/run.sh`, and [`scripts/publish-release.ps1`](scripts/publish-release.ps1) (production GitHub Releases) by `scripts/tests/publish-release.tests.ps1`; `test-scripts.yml` runs both on changes. App org defaults are `["dev", "production"]`. Reusable [`promote.yml`](.github/workflows/promote.yml) retags one `build_id` to an `environment` input; a missing or CI-only (index 0) target in `branches` is a no-op. Enrollment writes a thin `workflow_dispatch` caller so `trigger-promote` can dispatch it.
 
 The App resolves `approvals` into per-stage gates (`ResolveEnvironments`) and sends them to the tracker as `environments` in `RegisterProject`; the tracker removes environments that are no longer listed. `SyncConfigJob` re-registers on pushes to the default branch that touch `.deploytrack.yaml`. `resolve-config.sh` and the reusable workflows ignore `approvals`; gates are enforced by the tracker when a promote is triggered or recorded.
