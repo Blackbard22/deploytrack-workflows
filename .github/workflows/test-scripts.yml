@@ -1,7 +1,7 @@
 name: Test scripts
 
-# Runs the detect-step script tests (resolve-config.sh + check-components.sh)
-# whenever the scripts change.
+# Runs the script tests (resolve-config.sh, check-components.sh,
+# select-changed.sh and publish-release.ps1) whenever the scripts change.
 
 on:
   push:
@@ -30,3 +30,8 @@ jobs:
 
       - name: Run script tests
         run: bash scripts/tests/run.sh
+
+      # pwsh is preinstalled on ubuntu-latest.
+      - name: Run publish-release tests
+        shell: pwsh
+        run: ./scripts/tests/publish-release.tests.ps1

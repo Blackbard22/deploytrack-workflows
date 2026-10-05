@@ -4,13 +4,19 @@ name: DeployTrack — Dev CI
 # components and build paths come from the caller repo's .deploytrack.yaml,
 # its Compose file, or a root Dockerfile (see SPEC.md, "Components").
 #
-# Two stages:
-#   detect - resolve the components and check every Dockerfile exists. A
-#            declared component without its Dockerfile fails the run before
-#            anything is allocated. No components (new or empty repo) is a
-#            success with nothing to build.
-#   build  - one matrix leg per component; skipped when there are none.
-#            DeployTrack registers a component the first time it is built.
+# Three stages:
+#   baselines - ask DeployTrack which commit each component was last built
+#               from (runs on the build runner, which can reach the tracker).
+#   detect    - resolve the components and check every Dockerfile exists. A
+#               declared component without its Dockerfile fails the run before
+#               anything is allocated. No components (new or empty repo) is a
+#               success with nothing to build. Then keep only the components
+#               whose folder changed since their baseline (select-changed.sh;
+#               .deploytrack.yaml build.shared_changes / build.ignore tune it),
+#               plus any named in force_components.
+#   build     - one matrix leg per selected component; skipped when there are
+#               none. DeployTrack registers a component the first time it is
+#               built.
 #
 #   jobs:
 #     ci:
@@ -19,6 +25,7 @@ name: DeployTrack — Dev CI
 #         tracker_url: ${{ vars.TRACKER_URL }}
 #         project_id: ${{ vars.TRACKER_PROJECT_ID }}
 #         image_repo_prefix: ${{ vars.IMAGE_REPO_PREFIX }}
+#         force_components: ${{ inputs.build || '' }}
 #       secrets: inherit
 
 on:
@@ -46,6 +53,11 @@ on:
         required: false
         type: boolean
         default: false
+      force_components:
+        description: Components to build even if unchanged — blank = changed only, "all", or e.g. "frontend,backend"
+        required: false
+        type: string
+        default: ''
     secrets:
       CICD_WEBHOOK_SECRET:
         required: true
@@ -56,15 +68,50 @@ permissions:
   id-token: write
 
 jobs:
+  baselines:
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      json: ${{ steps.fetch.outputs.json }}
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Fetch build baselines
+        id: fetch
+        env:
+          TRACKER_URL: ${{ inputs.tracker_url }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+          PROJECT_ID: ${{ inputs.project_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $utf8 = New-Object System.Text.UTF8Encoding $false
+          $headers = @{}
+          if ($env:TRACKER_TOKEN) { $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)" }
+          $json = ''
+          try {
+            $resp = Invoke-WebRequest -UseBasicParsing -Method GET -Headers $headers `
+              -Uri "$($env:TRACKER_URL)/api/projects/$($env:PROJECT_ID)/build-baselines"
+            $json = ([string]$resp.Content).Trim()
+            Write-Host "Baselines: $json"
+          } catch {
+            # Without baselines every component builds, as before change detection.
+            Write-Host "::warning::Could not fetch build baselines from DeployTrack; building every component. $_"
+          }
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "json<<EOF`n$json`nEOF`n", $utf8)
+
   detect:
+    needs: baselines
     runs-on: ubuntu-latest
     outputs:
-      components: ${{ steps.check.outputs.components }}
-      has_components: ${{ steps.check.outputs.has_components }}
+      components: ${{ steps.select.outputs.components }}
+      has_components: ${{ steps.select.outputs.has_components }}
       branches: ${{ steps.parse.outputs.branches }}
     steps:
       - name: Checkout caller
         uses: actions/checkout@v4
+        with:
+          # select-changed.sh diffs against older commits.
+          fetch-depth: 0
 
       - name: Checkout workflows scripts
         if: hashFiles('scripts/resolve-config.sh') == ''
@@ -97,6 +144,16 @@ jobs:
         env:
           COMPONENTS: ${{ steps.parse.outputs.components }}
         run: bash "$SCRIPTS/check-components.sh"
+
+      - name: Select changed components
+        id: select
+        env:
+          COMPONENTS: ${{ steps.check.outputs.components }}
+          BASELINES: ${{ needs.baselines.outputs.json }}
+          FORCE: ${{ inputs.force_components }}
+          SHARED_CHANGES: ${{ steps.parse.outputs.shared_changes }}
+          IGNORE: ${{ steps.parse.outputs.ignore }}
+        run: bash "$SCRIPTS/select-changed.sh"
 
       - name: Summary (nothing to build)
         if: steps.check.outputs.has_components != 'true'

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Parse .deploytrack.yaml into matrix JSON for reusable workflows.
 # Usage: resolve-config.sh [path-to-.deploytrack.yaml]
-# Writes `components` and `branches` to GITHUB_OUTPUT when set; always prints them.
+# Writes `components`, `branches`, `shared_changes` and `ignore` to
+# GITHUB_OUTPUT when set; always prints them.
 #
 # Missing file, empty components, or components.infer: true → Compose inference
 # from the first file at repo root (cwd): docker-compose.yml, docker-compose.yaml,
@@ -14,6 +15,8 @@ set -euo pipefail
 
 CONFIG_FILE="${1:-.deploytrack.yaml}"
 DEFAULT_BRANCHES='["dev","production"]'
+# build.ignore default: docs and repo tooling never trigger an image build.
+DEFAULT_IGNORE='["*.md","docs/",".github/"]'
 APP_FALLBACK='[{"name":"app","path":".","dockerfile":"Dockerfile","image_suffix":"app"}]'
 
 if ! command -v yq >/dev/null 2>&1; then
@@ -151,8 +154,34 @@ else
   fi
 fi
 
+# build: {shared_changes: all|none, ignore: [patterns]} drives which
+# components dev CI rebuilds (see select-changed.sh).
+shared_changes="all"
+ignore="$DEFAULT_IGNORE"
+if [[ -f "$CONFIG_FILE" ]]; then
+  value="$(yq -r '.build.shared_changes // ""' "$CONFIG_FILE")"
+  if [[ -n "$value" ]]; then
+    shared_changes="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$shared_changes" != "all" && "$shared_changes" != "none" ]]; then
+      echo "build.shared_changes must be all or none, not '$value'" >&2
+      exit 1
+    fi
+  fi
+  ignore_type="$(yq -r '.build.ignore | type' "$CONFIG_FILE")"
+  case "$ignore_type" in
+    "!!null") ;;
+    "!!seq") ignore="$(yq -o=json -I=0 '.build.ignore' "$CONFIG_FILE")" ;;
+    *)
+      echo "build.ignore must be a list of path patterns" >&2
+      exit 1
+      ;;
+  esac
+fi
+
 echo "components=$components"
 echo "branches=$branches"
+echo "shared_changes=$shared_changes"
+echo "ignore=$ignore"
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   {
@@ -161,6 +190,10 @@ if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
     echo "EOF"
     echo "branches<<EOF"
     echo "$branches"
+    echo "EOF"
+    echo "shared_changes=$shared_changes"
+    echo "ignore<<EOF"
+    echo "$ignore"
     echo "EOF"
   } >> "$GITHUB_OUTPUT"
 fi

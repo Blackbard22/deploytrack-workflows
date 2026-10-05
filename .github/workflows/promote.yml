@@ -2,6 +2,8 @@ name: DeployTrack — Promote
 
 # Reusable promote: retag one build_id to an environment (no rebuild).
 # Target must appear in resolved branches and must not be index 0 (CI branch).
+# Promoting to the last branch (production) also publishes a GitHub Release
+# for the build's version at its commit (scripts/publish-release.ps1).
 #
 #   jobs:
 #     promote:
@@ -52,6 +54,8 @@ jobs:
     outputs:
       should_promote: ${{ steps.guard.outputs.should_promote }}
       predecessor: ${{ steps.guard.outputs.predecessor }}
+      is_last: ${{ steps.guard.outputs.is_last }}
+      component_count: ${{ steps.guard.outputs.component_count }}
       branches: ${{ steps.parse.outputs.branches }}
     steps:
       - name: Checkout caller
@@ -88,6 +92,7 @@ jobs:
         env:
           TARGET_ENV: ${{ inputs.environment }}
           BRANCHES: ${{ steps.parse.outputs.branches }}
+          COMPONENTS: ${{ steps.parse.outputs.components }}
         run: |
           set -euo pipefail
           TARGET="$(printf '%s' "$TARGET_ENV" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
@@ -116,9 +121,20 @@ jobs:
             echo "Target '$TARGET' is not in branches=$BRANCHES — no-op" >&2
           fi
 
+          # The last branch is production: promoting there publishes a GitHub
+          # Release. Tags carry the component name when there is more than one.
+          total="$(printf '%s' "$BRANCHES" | yq -r 'length')"
+          is_last=false
+          if [[ "$should_promote" == true && "$i" -eq $((total - 1)) ]]; then
+            is_last=true
+          fi
+          component_count="$(printf '%s' "${COMPONENTS:-[]}" | yq -r 'length')"
+
           {
             echo "should_promote=$should_promote"
             echo "predecessor=$predecessor"
+            echo "is_last=$is_last"
+            echo "component_count=$component_count"
           } >> "$GITHUB_OUTPUT"
 
   promote:
@@ -165,6 +181,8 @@ jobs:
           [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "env_tag=$envTag" + [Environment]::NewLine, $utf8)
           [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "version=$($build.version)" + [Environment]::NewLine, $utf8)
           [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "component=$($build.component)" + [Environment]::NewLine, $utf8)
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "commit_sha=$($build.commit_sha)" + [Environment]::NewLine, $utf8)
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "build_number=$($build.build_number)" + [Environment]::NewLine, $utf8)
           Write-Host "Promote build $($env:BUILD_ID) component=$($build.component) $dockerImage -> $envTag"
 
       - name: Login to GHCR
@@ -308,6 +326,38 @@ jobs:
           $sha = (git rev-parse HEAD).Trim()
           [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "env_sha=$sha" + [Environment]::NewLine, $utf8)
 
+      - name: Checkout workflows scripts
+        if: needs.setup.outputs.is_last == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: Blackbard22/deploytrack-workflows
+          path: _deploytrack_workflows
+          sparse-checkout: |
+            scripts
+          sparse-checkout-cone-mode: true
+
+      # The promote has already happened; a Releases problem only warns.
+      - name: Publish GitHub release
+        id: release
+        if: needs.setup.outputs.is_last == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMPONENT: ${{ steps.resolve.outputs.component }}
+          COMPONENT_COUNT: ${{ needs.setup.outputs.component_count }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          COMMIT_SHA: ${{ steps.resolve.outputs.commit_sha }}
+          BUILD_NUMBER: ${{ steps.resolve.outputs.build_number }}
+          BUILD_ID: ${{ inputs.build_id }}
+          DOCKER_IMAGE: ${{ steps.resolve.outputs.docker_image }}
+          ENV_TAG: ${{ steps.resolve.outputs.env_tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          $script = 'scripts/publish-release.ps1'
+          if (-not (Test-Path $script)) { $script = '_deploytrack_workflows/scripts/publish-release.ps1' }
+          & $script
+
       - name: Summary
         env:
           BUILD_ID: ${{ inputs.build_id }}
@@ -318,6 +368,10 @@ jobs:
           ENV_TAG: ${{ steps.resolve.outputs.env_tag }}
           ENV_SHA: ${{ steps.git_sync.outputs.env_sha }}
           SYNC_MODE: ${{ steps.git_sync.outputs.sync_mode }}
+          IS_LAST: ${{ needs.setup.outputs.is_last }}
+          RELEASE_OUTCOME: ${{ steps.release.outcome }}
+          RELEASE_URL: ${{ steps.release.outputs.release_url }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
         run: |
           @"
           ### DeployTrack (promote — $($env:PREDECESSOR) → $($env:ENVIRONMENT))
@@ -328,3 +382,10 @@ jobs:
           - **Git $($env:ENVIRONMENT) SHA:** ``$env:ENV_SHA``
           - **Git sync:** $env:SYNC_MODE
           "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          if ($env:IS_LAST -eq 'true') {
+            if ($env:RELEASE_OUTCOME -eq 'success' -and $env:RELEASE_URL) {
+              "- **GitHub release:** [$($env:RELEASE_TAG)]($($env:RELEASE_URL))" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            } else {
+              "- **GitHub release:** not published ($($env:RELEASE_OUTCOME)); see the Publish GitHub release step. The promote itself succeeded." | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+            }
+          }
