@@ -34,11 +34,6 @@ on:
         description: Target environment / branch (e.g. staging, production)
         required: true
         type: string
-      runner:
-        description: Runner label (Windows + Docker + PowerShell)
-        required: false
-        type: string
-        default: self-hosted
     secrets:
       CICD_WEBHOOK_SECRET:
         required: true
@@ -50,13 +45,18 @@ permissions:
 
 jobs:
   setup:
-    runs-on: ubuntu-latest
+    # Self-hosted Windows runner like promote; the steps run in Git Bash with
+    # yq from setup-tools.ps1.
+    runs-on: self-hosted
     outputs:
       should_promote: ${{ steps.guard.outputs.should_promote }}
       predecessor: ${{ steps.guard.outputs.predecessor }}
       is_last: ${{ steps.guard.outputs.is_last }}
       component_count: ${{ steps.guard.outputs.component_count }}
       branches: ${{ steps.parse.outputs.branches }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout caller
         uses: actions/checkout@v4
@@ -66,15 +66,23 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Blackbard22/deploytrack-workflows
+          # Same tag callers pin (@v1), so scripts match this workflow's version.
+          ref: v1
           path: _deploytrack_workflows
           sparse-checkout: |
             scripts
           sparse-checkout-cone-mode: true
 
-      - name: Install yq
+      - name: Install tools
+        shell: powershell
         run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.6/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
+          $script = 'scripts/setup-tools.ps1'
+          if (-not (Test-Path $script)) { $script = '_deploytrack_workflows/scripts/setup-tools.ps1' }
+          & (Resolve-Path $script)
+
+      - name: Tool versions
+        run: |
+          command -v bash yq
           yq --version
 
       - name: Parse .deploytrack.yaml
@@ -84,8 +92,7 @@ jobs:
           if [ ! -f "$SCRIPT" ]; then
             SCRIPT=_deploytrack_workflows/scripts/resolve-config.sh
           fi
-          chmod +x "$SCRIPT"
-          "$SCRIPT"
+          bash "$SCRIPT"
 
       - name: Guard environment against branches
         id: guard
@@ -140,7 +147,7 @@ jobs:
   promote:
     needs: setup
     if: needs.setup.outputs.should_promote == 'true'
-    runs-on: ${{ inputs.runner }}
+    runs-on: self-hosted
     permissions:
       contents: write
       packages: write
@@ -331,6 +338,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Blackbard22/deploytrack-workflows
+          # Same tag callers pin (@v1), so scripts match this workflow's version.
+          ref: v1
           path: _deploytrack_workflows
           sparse-checkout: |
             scripts
