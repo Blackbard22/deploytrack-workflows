@@ -7,7 +7,8 @@ name: DeployTrack — Dev CI
 # Three stages:
 #   baselines - ask DeployTrack which commit each component was last built
 #               from (runs on the build runner, which can reach the tracker).
-#   detect    - resolve the components and check every Dockerfile exists. A
+#   detect    - (on the build runner too, in Git Bash on Windows) resolve the
+#               components and check every Dockerfile exists. A
 #               declared component without its Dockerfile fails the run before
 #               anything is allocated. No components (new or empty repo) is a
 #               success with nothing to build. Then keep only the components
@@ -101,11 +102,16 @@ jobs:
 
   detect:
     needs: baselines
-    runs-on: ubuntu-latest
+    # Same runner as the other jobs. On Windows the steps run in Git Bash with
+    # jq and yq from setup-tools.ps1.
+    runs-on: ${{ inputs.runner }}
     outputs:
       components: ${{ steps.select.outputs.components }}
       has_components: ${{ steps.select.outputs.has_components }}
       branches: ${{ steps.parse.outputs.branches }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout caller
         uses: actions/checkout@v4
@@ -123,10 +129,24 @@ jobs:
             scripts
           sparse-checkout-cone-mode: true
 
-      - name: Install yq
+      - name: Install tools (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $script = 'scripts/setup-tools.ps1'
+          if (-not (Test-Path $script)) { $script = '_deploytrack_workflows/scripts/setup-tools.ps1' }
+          & (Resolve-Path $script)
+
+      - name: Install yq (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.6/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
+
+      - name: Tool versions
+        run: |
+          command -v bash jq yq
+          jq --version
           yq --version
 
       - name: Resolve components

@@ -140,11 +140,13 @@ Do not combine `infer: true` with a component list. If both appear, `infer: true
 
 ## Detect and build
 
-`dev-ci.yml` runs in three stages.
+`dev-ci.yml` runs in three stages, all on the `runner` input (default `self-hosted`). `promote.yml` does the same for its `setup` and `promote` jobs. Nothing needs a GitHub-hosted runner, so private repos in an org without hosted-runner minutes still run.
+
+**Runner requirements (Windows):** PowerShell, Docker and [Git for Windows](https://gitforwindows.org/). `detect` and promote's `setup` are bash steps, so they run in Git Bash; [`scripts/setup-tools.ps1`](scripts/setup-tools.ps1) puts Git Bash first on `PATH` (ahead of WSL's `System32\bash.exe`) and installs pinned, checksum-verified `jq` and `yq` into the runner tool cache on first use. A Linux runner works for these jobs too (it installs `yq`, and uses the preinstalled `jq`), but `baselines`, `build` and `promote` need Windows PowerShell.
 
 **`baselines`** (on the build runner) asks DeployTrack, via `GET /api/projects/{id}/build-baselines`, which commit each component was last built from: its newest build with a successful deploy to the first pipeline stage. If the call fails, every component builds.
 
-**`detect`** resolves the components with the rules above (`scripts/resolve-config.sh`), then checks that each one can be built (`scripts/check-components.sh`): the build context `path` must be a directory and `{path}/{dockerfile}` must exist.
+**`detect`** (on the build runner, in Git Bash) resolves the components with the rules above (`scripts/resolve-config.sh`), then checks that each one can be built (`scripts/check-components.sh`): the build context `path` must be a directory and `{path}/{dockerfile}` must exist.
 
 - **A declared component without its Dockerfile fails the whole run.** This applies to components from `.deploytrack.yaml` and from Compose `build:` services. Every missing file is reported as an error, nothing is allocated in DeployTrack, and no component is built until it is fixed.
 - **No components is a success.** The run ends green with a summary saying there is nothing to build, and the `build` job is skipped.
