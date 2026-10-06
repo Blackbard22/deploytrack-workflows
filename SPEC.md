@@ -140,9 +140,9 @@ Do not combine `infer: true` with a component list. If both appear, `infer: true
 
 ## Detect and build
 
-`dev-ci.yml` runs in three stages, all on the `runner` input (default `self-hosted`). `promote.yml` does the same for its `setup` and `promote` jobs. Nothing needs a GitHub-hosted runner, so private repos in an org without hosted-runner minutes still run.
+`dev-ci.yml` runs in three stages, all on a `self-hosted` runner. `promote.yml` does the same for its `setup` and `promote` jobs. The workflows only run on self-hosted runners: nothing uses a GitHub-hosted runner, so private repos in an org without hosted-runner minutes still run.
 
-**Runner requirements (Windows):** PowerShell, Docker and [Git for Windows](https://gitforwindows.org/). `detect` and promote's `setup` are bash steps, so they run in Git Bash; [`scripts/setup-tools.ps1`](scripts/setup-tools.ps1) puts Git Bash first on `PATH` (ahead of WSL's `System32\bash.exe`) and installs pinned, checksum-verified `jq` and `yq` into the runner tool cache on first use. A Linux runner works for these jobs too (it installs `yq`, and uses the preinstalled `jq`), but `baselines`, `build` and `promote` need Windows PowerShell.
+**Runner requirements:** a Windows self-hosted runner with PowerShell, Docker and [Git for Windows](https://gitforwindows.org/). `detect` and promote's `setup` are bash steps, so they run in Git Bash; [`scripts/setup-tools.ps1`](scripts/setup-tools.ps1) puts Git Bash first on `PATH` (ahead of WSL's `System32\bash.exe`) and installs pinned, checksum-verified `jq` and `yq` into the runner tool cache on first use.
 
 **`baselines`** (on the build runner) asks DeployTrack, via `GET /api/projects/{id}/build-baselines`, which commit each component was last built from: its newest build with a successful deploy to the first pipeline stage. If the call fails, every component builds.
 

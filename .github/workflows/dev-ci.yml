@@ -7,7 +7,7 @@ name: DeployTrack — Dev CI
 # Three stages:
 #   baselines - ask DeployTrack which commit each component was last built
 #               from (runs on the build runner, which can reach the tracker).
-#   detect    - (on the build runner too, in Git Bash on Windows) resolve the
+#   detect    - (on the build runner too, in Git Bash) resolve the
 #               components and check every Dockerfile exists. A
 #               declared component without its Dockerfile fails the run before
 #               anything is allocated. No components (new or empty repo) is a
@@ -44,11 +44,6 @@ on:
         description: GHCR image prefix; each component appends -<image_suffix>
         required: true
         type: string
-      runner:
-        description: Runner label for the build matrix (Windows + Docker + PowerShell)
-        required: false
-        type: string
-        default: self-hosted
       fail_lint:
         description: Force lint failure (smoke-test failed deploy reporting)
         required: false
@@ -70,7 +65,7 @@ permissions:
 
 jobs:
   baselines:
-    runs-on: ${{ inputs.runner }}
+    runs-on: self-hosted
     outputs:
       json: ${{ steps.fetch.outputs.json }}
     defaults:
@@ -102,9 +97,9 @@ jobs:
 
   detect:
     needs: baselines
-    # Same runner as the other jobs. On Windows the steps run in Git Bash with
-    # jq and yq from setup-tools.ps1.
-    runs-on: ${{ inputs.runner }}
+    # Self-hosted Windows runner like the other jobs; the steps run in Git Bash
+    # with jq and yq from setup-tools.ps1.
+    runs-on: self-hosted
     outputs:
       components: ${{ steps.select.outputs.components }}
       has_components: ${{ steps.select.outputs.has_components }}
@@ -129,19 +124,12 @@ jobs:
             scripts
           sparse-checkout-cone-mode: true
 
-      - name: Install tools (Windows)
-        if: runner.os == 'Windows'
+      - name: Install tools
         shell: powershell
         run: |
           $script = 'scripts/setup-tools.ps1'
           if (-not (Test-Path $script)) { $script = '_deploytrack_workflows/scripts/setup-tools.ps1' }
           & (Resolve-Path $script)
-
-      - name: Install yq (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.6/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
 
       - name: Tool versions
         run: |
@@ -188,7 +176,7 @@ jobs:
     needs: detect
     # GitHub rejects an empty matrix, so skip the job when there is nothing to build.
     if: needs.detect.outputs.has_components == 'true'
-    runs-on: ${{ inputs.runner }}
+    runs-on: self-hosted
     strategy:
       fail-fast: false
       matrix:

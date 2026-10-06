@@ -34,11 +34,6 @@ on:
         description: Target environment / branch (e.g. staging, production)
         required: true
         type: string
-      runner:
-        description: Runner label (Windows + Docker + PowerShell)
-        required: false
-        type: string
-        default: self-hosted
     secrets:
       CICD_WEBHOOK_SECRET:
         required: true
@@ -50,9 +45,9 @@ permissions:
 
 jobs:
   setup:
-    # Same runner as promote. On Windows the steps run in Git Bash with yq
-    # from setup-tools.ps1.
-    runs-on: ${{ inputs.runner }}
+    # Self-hosted Windows runner like promote; the steps run in Git Bash with
+    # yq from setup-tools.ps1.
+    runs-on: self-hosted
     outputs:
       should_promote: ${{ steps.guard.outputs.should_promote }}
       predecessor: ${{ steps.guard.outputs.predecessor }}
@@ -76,19 +71,12 @@ jobs:
             scripts
           sparse-checkout-cone-mode: true
 
-      - name: Install tools (Windows)
-        if: runner.os == 'Windows'
+      - name: Install tools
         shell: powershell
         run: |
           $script = 'scripts/setup-tools.ps1'
           if (-not (Test-Path $script)) { $script = '_deploytrack_workflows/scripts/setup-tools.ps1' }
           & (Resolve-Path $script)
-
-      - name: Install yq (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.6/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
 
       - name: Tool versions
         run: |
@@ -157,7 +145,7 @@ jobs:
   promote:
     needs: setup
     if: needs.setup.outputs.should_promote == 'true'
-    runs-on: ${{ inputs.runner }}
+    runs-on: self-hosted
     permissions:
       contents: write
       packages: write
