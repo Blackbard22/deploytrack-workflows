@@ -168,6 +168,18 @@ A component with `path: .` owns the whole repo, so any non-ignored change builds
 
 **`build`** runs one matrix leg per selected component, as before.
 
+### Failure reporting
+
+Every dev CI failure reaches DeployTrack, which shows it as a notification. Reports are best effort: if one cannot be sent (tracker down, old tracker without the endpoint), the run logs a warning and the original failure stays the one shown.
+
+- **Before a build is allocated** (`baselines` or `detect` failed): there is no build to fail, so the `report-failure` job posts `POST /api/projects/{id}/ci-failures` (a `CI_FAILED` event) with `stage`, `message`, `run_url`, `commit_sha`, `branch` and `workflow: dev-ci`, using [`scripts/report-ci-failure.sh`](scripts/report-ci-failure.sh). `stage` is `baselines`, or the first failed `detect` step: `checkout`, `tools`, `resolve`, `check_components` or `select`. `message` is the first `::error::` line the detect scripts printed (e.g. `Component 'api': Dockerfile 'api/Dockerfile' not found`), else their last output line, else `CI failed at <stage>`; it is cut to 2000 characters.
+- **In a `build` leg**, one `Report failure` step at the end of the job covers every step:
+  - Allocation failed (or the leg failed before it): `POST /api/projects/{id}/ci-failures` with `stage: allocate` (or `checkout`), the leg's `component`, and DeployTrack's error as `message`.
+  - After allocation: `POST /api/deployments` with `status: failed` for `dev` (a `BUILD_FAILED` event), plus `stage` (`lint`, `login`, `build` or `record`), `error` and `run_url`.
+  - Once the dev deployment is recorded as a success, a later failure is not reported, since a failed deployment would contradict it.
+
+`run_url` links to the run attempt (`…/actions/runs/{id}/attempts/{n}`), so DeployTrack can ignore a repeated report for the same attempt.
+
 ---
 
 ## Production releases
@@ -243,6 +255,6 @@ So `[dev, staging, production]` defaults to `dev: qa`, `staging: client`, and `[
 
 ## Implementation status
 
-App and [`scripts/resolve-config.sh`](scripts/resolve-config.sh) implement Compose inference from the first repo-root Compose file (`docker-compose.yml` → `docker-compose.yaml` → `compose.yml` → `compose.yaml`). Missing yaml, empty or omitted components, and `components.infer: true` expand to the same explicit list (or the `app` fallback when `./Dockerfile` exists, else no components). [`scripts/check-components.sh`](scripts/check-components.sh) is the `detect` job's Dockerfile check; [`scripts/select-changed.sh`](scripts/select-changed.sh) picks the components that changed. All three are covered by `scripts/tests/run.sh`, and [`scripts/publish-release.ps1`](scripts/publish-release.ps1) (production GitHub Releases) by `scripts/tests/publish-release.tests.ps1`; `test-scripts.yml` runs both on changes. App org defaults are `["dev", "production"]`. Reusable [`promote.yml`](.github/workflows/promote.yml) retags one `build_id` to an `environment` input; a missing or CI-only (index 0) target in `branches` is a no-op. Enrollment writes a thin `workflow_dispatch` caller so `trigger-promote` can dispatch it.
+App and [`scripts/resolve-config.sh`](scripts/resolve-config.sh) implement Compose inference from the first repo-root Compose file (`docker-compose.yml` → `docker-compose.yaml` → `compose.yml` → `compose.yaml`). Missing yaml, empty or omitted components, and `components.infer: true` expand to the same explicit list (or the `app` fallback when `./Dockerfile` exists, else no components). [`scripts/check-components.sh`](scripts/check-components.sh) is the `detect` job's Dockerfile check; [`scripts/select-changed.sh`](scripts/select-changed.sh) picks the components that changed, and [`scripts/report-ci-failure.sh`](scripts/report-ci-failure.sh) reports a failure before allocation. All four are covered by `scripts/tests/run.sh`, and [`scripts/publish-release.ps1`](scripts/publish-release.ps1) (production GitHub Releases) by `scripts/tests/publish-release.tests.ps1`; `test-scripts.yml` runs both on changes. App org defaults are `["dev", "production"]`. Reusable [`promote.yml`](.github/workflows/promote.yml) retags one `build_id` to an `environment` input; a missing or CI-only (index 0) target in `branches` is a no-op. Enrollment writes a thin `workflow_dispatch` caller so `trigger-promote` can dispatch it.
 
 The App resolves `approvals` into per-stage gates (`ResolveEnvironments`) and sends them to the tracker as `environments` in `RegisterProject`; the tracker removes environments that are no longer listed. `SyncConfigJob` re-registers on pushes to the default branch that touch `.deploytrack.yaml`. `resolve-config.sh` and the reusable workflows ignore `approvals`; gates are enforced by the tracker when a promote is triggered or recorded.

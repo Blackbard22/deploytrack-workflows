@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Tests for resolve-config.sh + check-components.sh, the dev CI detect step.
-# Each case builds a throwaway repo layout and runs both scripts in it.
+# Tests for the dev CI detect scripts (resolve-config.sh, check-components.sh,
+# select-changed.sh) and its failure report (report-ci-failure.sh).
+# Most cases build a throwaway repo layout and run the scripts in it.
 # Needs bash, jq and yq (mikefarah). Usage: scripts/tests/run.sh
 
 set -uo pipefail
@@ -304,6 +305,124 @@ else
   sed 's/^/     | /' <<<"$out"
   [[ -f "$summary" ]] && sed 's/^/     S /' "$summary"
 fi
+rm -rf "$dir"
+
+# ---------------------------------------------------------------------------
+# report-ci-failure.sh: dev CI failures before a build is allocated
+
+# check NAME CONDITION [DETAIL]: one assertion, CONDITION evaluated by eval.
+check() {
+  cases=$((cases + 1))
+  if eval "$2"; then
+    echo "ok   $1"
+  else
+    failures=$((failures + 1))
+    echo "FAIL $1"
+    [[ -n "${3:-}" ]] && sed 's/^/     | /' <<<"$3"
+  fi
+}
+
+# Helpers without posting: sourcing must not run main.
+helpers="$(source "$SCRIPTS/report-ci-failure.sh" && declare -F | awk '{print $3}' | tr '\n' ' ')"
+check "sourcing defines the helpers and posts nothing" \
+  '[[ " $helpers " == *" failure_stage "* && " $helpers " == *" failure_message "* && " $helpers " == *" build_payload "* ]]' "$helpers"
+
+stage() { (source "$SCRIPTS/report-ci-failure.sh" && failure_stage); }
+check "stage: first failed step wins" \
+  '[[ "$(RESOLVE_OUTCOME=success CHECK_OUTCOME=failure SELECT_OUTCOME=failure stage)" == check_components ]]'
+check "stage: scripts checkout counts as checkout" \
+  '[[ "$(CHECKOUT_OUTCOME=success CHECKOUT_SCRIPTS_OUTCOME=failure TOOLS_OUTCOME=skipped stage)" == checkout ]]'
+check "stage: tool versions counts as tools" \
+  '[[ "$(TOOLS_OUTCOME=success TOOL_VERSIONS_OUTCOME=failure stage)" == tools ]]'
+check "stage: select" \
+  '[[ "$(RESOLVE_OUTCOME=success CHECK_OUTCOME=success SELECT_OUTCOME=failure stage)" == select ]]'
+check "stage: nothing failed falls back to detect" \
+  '[[ "$(RESOLVE_OUTCOME=success CHECK_OUTCOME=cancelled stage)" == detect ]]'
+
+dir="$(mktemp -d)"
+msg() { (source "$SCRIPTS/report-ci-failure.sh" && failure_message "$1"); }
+printf '%s\n' "components=[]" "::notice::Component 'x' builds externally" \
+  "::error::Component 'api': Dockerfile 'api/Dockerfile' not found" \
+  "::error::Component 'web': build context 'web' not found" \
+  "2 component(s) cannot be built." >"$dir/two-errors.log"
+check "message: first ::error:: line, more errors counted" \
+  '[[ "$(msg "$dir/two-errors.log")" == "Component '"'"'api'"'"': Dockerfile '"'"'api/Dockerfile'"'"' not found (and 1 more errors)" ]]' \
+  "$(msg "$dir/two-errors.log")"
+printf '%s\r\n' "noise" "::error file=C:\\repo\\.deploytrack.yaml,line=3::bad shared_changes" >"$dir/file-prefix.log"
+check "message: ::error file=...:: prefix and CR stripped" \
+  '[[ "$(msg "$dir/file-prefix.log")" == "bad shared_changes" ]]' "$(msg "$dir/file-prefix.log" | od -c | head -3)"
+printf '%s\n' "resolving" "yq: Error: bad file '.deploytrack.yaml'" "   " "" >"$dir/no-error.log"
+check "message: no ::error:: line uses the last non-empty line" \
+  '[[ "$(msg "$dir/no-error.log")" == "yq: Error: bad file '"'"'.deploytrack.yaml'"'"'" ]]' "$(msg "$dir/no-error.log")"
+printf '%s\n' "::warning::select failed: bad EXTERNAL" >"$dir/warning.log"
+check "message: workflow command prefix stripped from the last line" \
+  '[[ "$(msg "$dir/warning.log")" == "select failed: bad EXTERNAL" ]]' "$(msg "$dir/warning.log")"
+check "message: missing log prints nothing" '[[ -z "$(msg "$dir/nope.log")" ]]'
+
+payload() { (source "$SCRIPTS/report-ci-failure.sh" && build_payload); }
+p="$(STAGE=check_components MESSAGE=$'Component "api": "quoted"\nsecond line' RUN_URL=https://github.com/acme/web/actions/runs/1/attempts/2 \
+  COMMIT_SHA=0123456789abcdef0123456789abcdef01234567 BRANCH=dev COMPONENT=api payload)"
+check "payload: every field, JSON-escaped message" \
+  '[[ "$(jq -r "[.stage, .message, .run_url, .commit_sha, .branch, .component, .workflow] | join(\"|\")" <<<"$p")" == "check_components|Component \"api\": \"quoted\"
+second line|https://github.com/acme/web/actions/runs/1/attempts/2|0123456789abcdef0123456789abcdef01234567|dev|api|dev-ci" ]]' "$p"
+p="$(STAGE=resolve payload)"
+check "payload: default message, empty fields left out" \
+  '[[ "$p" == "{\"stage\":\"resolve\",\"message\":\"CI failed at resolve\",\"workflow\":\"dev-ci\"}" ]]' "$p"
+p="$(STAGE=select MESSAGE="$(printf 'é%.0s' $(seq 2500))" payload)"
+check "payload: message cut to 2000 characters" '[[ "$(jq -r ".message | length" <<<"$p")" == 2000 ]]' "$(head -c 200 <<<"$p")"
+p="$(STAGE=baselines RUN_URL=http://ghes.local/acme/web/actions/runs/1 payload)"
+check "payload: non-https run_url left out" '[[ "$(jq -r "has(\"run_url\")" <<<"$p")" == false ]]' "$p"
+
+# A fake curl that records the request in $FAKE_DIR and answers with
+# $FAKE_STATUS / $FAKE_EXIT. Kept in the temp dir (not tests/fakes/).
+cat >"$dir/curl" <<'EOF'
+#!/usr/bin/env bash
+out=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -w|-X) shift 2 ;;
+    -H) [[ "$2" == @* ]] && cat "${2#@}" >>"$FAKE_DIR/headers"; shift 2 ;;
+    --data-binary) cat "${2#@}" >"$FAKE_DIR/body"; shift 2 ;;
+    -*) shift ;;
+    *) echo "$1" >"$FAKE_DIR/url"; shift ;;
+  esac
+done
+[[ "${FAKE_EXIT:-0}" == 0 ]] || { echo "curl: (7) Failed to connect" >&2; exit "$FAKE_EXIT"; }
+[[ -n "$out" ]] && printf '%s' '{"error":"stage is invalid"}' >"$out"
+printf '%s' "${FAKE_STATUS:-201}"
+EOF
+chmod +x "$dir/curl"
+
+# report [ENV=VALUE...]: run the script with the fake curl; sets out, rc.
+report() {
+  rm -rf "$dir/req" && mkdir "$dir/req"
+  out="$(env -i PATH="$PATH" HOME="$HOME" CURL="$dir/curl" FAKE_DIR="$dir/req" \
+    TRACKER_URL=https://tracker.example/ TRACKER_TOKEN=s3cr3t-token PROJECT_ID=7 \
+    STAGE=check_components MESSAGE="Dockerfile 'api/Dockerfile' not found" "$@" \
+    bash "$SCRIPTS/report-ci-failure.sh" 2>&1)"
+  rc=$?
+}
+
+report
+check "post: URL, Authorization header and body sent; token not printed" \
+  '[[ $rc == 0 && "$(cat "$dir/req/url")" == https://tracker.example/api/projects/7/ci-failures ]] &&
+   grep -qx "Authorization: Bearer s3cr3t-token" "$dir/req/headers" &&
+   grep -qx "Content-Type: application/json" "$dir/req/headers" &&
+   [[ "$(jq -r .stage "$dir/req/body")" == check_components ]] &&
+   [[ "$out" == *"Reported the CI failure"* && "$out" != *s3cr3t* ]]' "$out"
+report FAKE_STATUS=422
+check "post: non-2xx is a warning and exit 0" \
+  '[[ $rc == 0 && "$out" == "::warning::DeployTrack rejected the CI failure report (HTTP 422)"* && "$out" != *s3cr3t* ]]' "$out"
+report FAKE_EXIT=7
+check "post: curl error is a warning and exit 0" \
+  '[[ $rc == 0 && "$out" == "::warning::Could not report the CI failure to DeployTrack (curl exit 7)"* ]]' "$out"
+report TRACKER_URL=
+check "post: no tracker URL skips the report" \
+  '[[ $rc == 0 && "$out" == "::warning::TRACKER_URL is not set"* && ! -f "$dir/req/url" ]]' "$out"
+report TRACKER_TOKEN=
+check "post: no token sends no Authorization header" \
+  '[[ $rc == 0 ]] && ! grep -q Authorization "$dir/req/headers"' "$out"
 rm -rf "$dir"
 
 echo
