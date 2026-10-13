@@ -2,6 +2,9 @@ name: DeployTrack — Promote
 
 # Reusable promote: retag one build_id to an environment (no rebuild).
 # Target must appear in resolved branches and must not be index 0 (CI branch).
+# Index 0 is how DeployTrack finishes an import started from its UI: the
+# `import` job retags that pending import (register-build action, retag-only
+# mode). For any other build it has nothing to import and does nothing.
 # Promoting to the last branch (production) also publishes a GitHub Release
 # for the build's version at its commit (scripts/publish-release.ps1).
 #
@@ -50,6 +53,7 @@ jobs:
     runs-on: self-hosted
     outputs:
       should_promote: ${{ steps.guard.outputs.should_promote }}
+      is_ci_branch: ${{ steps.guard.outputs.is_ci_branch }}
       predecessor: ${{ steps.guard.outputs.predecessor }}
       is_last: ${{ steps.guard.outputs.is_last }}
       component_count: ${{ steps.guard.outputs.component_count }}
@@ -106,6 +110,7 @@ jobs:
           echo "resolved branches=$BRANCHES target=$TARGET" >&2
 
           should_promote=false
+          is_ci_branch=false
           predecessor=""
           i=0
           found=false
@@ -117,7 +122,8 @@ jobs:
                 should_promote=true
                 predecessor="$(printf '%s' "$BRANCHES" | yq -r ".[$((i - 1))]")"
               else
-                echo "Target '$TARGET' is the CI branch (branches index 0) — no-op" >&2
+                is_ci_branch=true
+                echo "Target '$TARGET' is the CI branch (branches index 0) — no promote; the import job finishes a pending import if there is one" >&2
               fi
               break
             fi
@@ -139,10 +145,47 @@ jobs:
 
           {
             echo "should_promote=$should_promote"
+            echo "is_ci_branch=$is_ci_branch"
             echo "predecessor=$predecessor"
             echo "is_last=$is_last"
             echo "component_count=$component_count"
           } >> "$GITHUB_OUTPUT"
+
+  # An image built outside DeployTrack and imported from its UI: retag it to
+  # its allocated version with the workflow token and report the result.
+  # Managed builds and finished imports answer "nothing to import".
+  import:
+    needs: setup
+    if: needs.setup.outputs.is_ci_branch == 'true'
+    runs-on: self-hosted
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout workflows scripts
+        uses: actions/checkout@v4
+        with:
+          repository: Blackbard22/deploytrack-workflows
+          # Same tag callers pin (@v1), so scripts match this workflow's version.
+          ref: v1
+          path: _deploytrack_workflows
+          sparse-checkout: |
+            scripts
+          sparse-checkout-cone-mode: true
+
+      # Git Bash and jq for the action's bash step.
+      - name: Install tools
+        shell: powershell
+        run: |
+          & (Resolve-Path '_deploytrack_workflows/scripts/setup-tools.ps1')
+
+      - name: Import pending build
+        uses: Blackbard22/deploytrack-workflows/register-build@v1
+        with:
+          tracker_url: ${{ inputs.tracker_url }}
+          token: ${{ secrets.CICD_WEBHOOK_SECRET }}
+          build_id: ${{ inputs.build_id }}
+          registry_token: ${{ secrets.GITHUB_TOKEN }}
 
   promote:
     needs: setup
