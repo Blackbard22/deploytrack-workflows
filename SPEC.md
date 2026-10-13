@@ -169,6 +169,37 @@ A component with `path: .` owns the whole repo, so any non-ignored change builds
 
 ---
 
+## External builds
+
+A component can be built outside DeployTrack (Buildx or Bake, Bazel, Nix, a vendor build service, another CI system, multi-arch builds). An admin sets its **build mode** to *External build* in the project workspace; the mode is a DeployTrack setting, not a `.deploytrack.yaml` field. Dev CI does not build external components.
+
+The team builds and pushes the image itself, then **imports** it. DeployTrack allocates the version and build number exactly as for a CI build, and the image is retagged **inside the registry** to `repo:<version>-build<N>` with `docker buildx imagetools create` (no pull, no rebuild; a multi-arch manifest list keeps its digest). DeployTrack stores the image's digest on the build. Once the retag succeeds the build counts as deployed to the first pipeline stage, so it promotes and links tickets like any other build.
+
+Two ways to import:
+
+- **From a workflow:** the [`register-build`](register-build/README.md) action, one step after the push. It retags with the job's `GITHUB_TOKEN` and writes the version to the job summary.
+  ```yaml
+  - uses: Blackbard22/deploytrack-workflows/register-build@v1
+    with:
+      tracker_url: ${{ vars.TRACKER_URL }}
+      token: ${{ secrets.CICD_WEBHOOK_SECRET }}
+      component: backend
+      image: ghcr.io/org/app-backend@${{ steps.push.outputs.digest }}
+  ```
+- **From the DeployTrack UI:** paste the image reference. DeployTrack dispatches the repo's `promote.yml` caller with `environment` set to the first stage, and the reusable `promote.yml` runs its `import` job: the same action in retag-only mode (`build_id`), which retags the pending import and reports back. For a build that is not a pending import, that job does nothing.
+
+Importing the same digest and commit again returns the existing build. A failed import is retried by importing again; it keeps its version.
+
+**Rules for users**
+
+- Push to the component's own image repository. DeployTrack refuses images from any other repository and retags inside that one.
+- The commit must be the one the image was built from: ticket links come from the commit range. It is required.
+- Don't push DeployTrack's version tags (`1.4.0-build2`) or environment tags (`dev`, `staging`, …) yourself. They are refused as import input; pass the digest of your own push.
+
+**One-time setup:** the repo is enrolled through the GitHub App (it has the `CICD_WEBHOOK_SECRET` secret); the component is set to external, with its image repository; the importing workflow grants `packages: write` to `GITHUB_TOKEN`, or passes a PAT as `registry_token` for a registry outside the repo's org.
+
+---
+
 ## Production releases
 
 When `promote.yml` promotes a build to the **last** entry in `branches` (production), it also publishes a GitHub Release, so the repo's Releases page always shows what production runs (`scripts/publish-release.ps1`).
@@ -242,6 +273,6 @@ So `[dev, staging, production]` defaults to `dev: qa`, `staging: client`, and `[
 
 ## Implementation status
 
-App and [`scripts/resolve-config.sh`](scripts/resolve-config.sh) implement Compose inference from the first repo-root Compose file (`docker-compose.yml` → `docker-compose.yaml` → `compose.yml` → `compose.yaml`). Missing yaml, empty or omitted components, and `components.infer: true` expand to the same explicit list (or the `app` fallback when `./Dockerfile` exists, else no components). [`scripts/check-components.sh`](scripts/check-components.sh) is the `detect` job's Dockerfile check; [`scripts/select-changed.sh`](scripts/select-changed.sh) picks the components that changed. All three are covered by `scripts/tests/run.sh`, and [`scripts/publish-release.ps1`](scripts/publish-release.ps1) (production GitHub Releases) by `scripts/tests/publish-release.tests.ps1`; `test-scripts.yml` runs both on changes. App org defaults are `["dev", "production"]`. Reusable [`promote.yml`](.github/workflows/promote.yml) retags one `build_id` to an `environment` input; a missing or CI-only (index 0) target in `branches` is a no-op. Enrollment writes a thin `workflow_dispatch` caller so `trigger-promote` can dispatch it.
+App and [`scripts/resolve-config.sh`](scripts/resolve-config.sh) implement Compose inference from the first repo-root Compose file (`docker-compose.yml` → `docker-compose.yaml` → `compose.yml` → `compose.yaml`). Missing yaml, empty or omitted components, and `components.infer: true` expand to the same explicit list (or the `app` fallback when `./Dockerfile` exists, else no components). [`scripts/check-components.sh`](scripts/check-components.sh) is the `detect` job's Dockerfile check; [`scripts/select-changed.sh`](scripts/select-changed.sh) picks the components that changed. All three are covered by `scripts/tests/run.sh`, and [`scripts/publish-release.ps1`](scripts/publish-release.ps1) (production GitHub Releases) by `scripts/tests/publish-release.tests.ps1`; `test-scripts.yml` runs both on changes. App org defaults are `["dev", "production"]`. Reusable [`promote.yml`](.github/workflows/promote.yml) retags one `build_id` to an `environment` input; a target missing from `branches` is a no-op, and the CI-only (index 0) target only finishes a pending import (the `import` job) and is otherwise a no-op. The [`register-build`](register-build/action.yml) action is covered by `scripts/tests/register-build.tests.sh`. Enrollment writes a thin `workflow_dispatch` caller so `trigger-promote` can dispatch it.
 
 The App resolves `approvals` into per-stage gates (`ResolveEnvironments`) and sends them to the tracker as `environments` in `RegisterProject`; the tracker removes environments that are no longer listed. `SyncConfigJob` re-registers on pushes to the default branch that touch `.deploytrack.yaml`. `resolve-config.sh` and the reusable workflows ignore `approvals`; gates are enforced by the tracker when a promote is triggered or recorded.
