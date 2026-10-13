@@ -223,12 +223,18 @@ jobs:
             $dockerImage = [string]$build.build.docker_image
           }
           if ([string]::IsNullOrWhiteSpace($dockerImage)) { throw 'build has no docker_image' }
+          $sourceDigest = [string]$build.source_digest
+          if (-not $sourceDigest -and $build.build) {
+            $sourceDigest = [string]$build.build.source_digest
+          }
           $parts = $dockerImage -split ':', 2
           $envName = $env:ENVIRONMENT.Trim().ToLowerInvariant()
           $envTag = "$($parts[0]):$envName"
 
           [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "docker_image=$dockerImage" + [Environment]::NewLine, $utf8)
           [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "env_tag=$envTag" + [Environment]::NewLine, $utf8)
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "image_repo=$($parts[0])" + [Environment]::NewLine, $utf8)
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "source_digest=$($sourceDigest.Trim())" + [Environment]::NewLine, $utf8)
           [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "version=$($build.version)" + [Environment]::NewLine, $utf8)
           [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "component=$($build.component)" + [Environment]::NewLine, $utf8)
           [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "commit_sha=$($build.commit_sha)" + [Environment]::NewLine, $utf8)
@@ -248,9 +254,21 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($token)) { throw 'GITHUB_TOKEN is empty; the caller must grant packages: write' }
           $user = $user.Trim()
           $token = $token.Trim()
+          # A fresh config also loses the CLI plugins (buildx) that live beside
+          # the usual one (Docker Desktop: ~/.docker/cli-plugins), so carry
+          # only cliPluginsExtraDirs over, plus that directory.
+          $orig = $env:DOCKER_CONFIG
+          if ([string]::IsNullOrWhiteSpace($orig)) { $orig = Join-Path $env:USERPROFILE '.docker' }
+          $pluginDirs = @()
+          try {
+            $origCfg = Get-Content -Raw -Path (Join-Path $orig 'config.json') -ErrorAction Stop | ConvertFrom-Json
+            if ($origCfg.cliPluginsExtraDirs) { $pluginDirs += @($origCfg.cliPluginsExtraDirs) }
+          } catch {}
+          $pluginDirs += (Join-Path $orig 'cli-plugins')
           $cfg = Join-Path $env:RUNNER_TEMP 'docker-config'
           New-Item -ItemType Directory -Force -Path $cfg | Out-Null
-          Set-Content -Path (Join-Path $cfg 'config.json') -Value '{}'
+          $cfgJson = @{ cliPluginsExtraDirs = @($pluginDirs | Select-Object -Unique) } | ConvertTo-Json -Compress
+          [System.IO.File]::WriteAllText((Join-Path $cfg 'config.json'), $cfgJson, $utf8)
           [System.IO.File]::AppendAllText($env:GITHUB_ENV, "DOCKER_CONFIG=$cfg" + [Environment]::NewLine, $utf8)
           $env:DOCKER_CONFIG = $cfg
           $patFile = Join-Path $env:RUNNER_TEMP 'ghcr.pat'
@@ -262,10 +280,15 @@ jobs:
             Remove-Item -Force $patFile -ErrorAction SilentlyContinue
           }
 
+      # Registry-side copy with buildx imagetools: the env tag gets the
+      # build's exact manifest (a multi-arch index keeps every platform and
+      # its digest). Needs buildx on the runner (Docker Desktop ships it).
       - name: Retag image for environment
         id: retag
         env:
           DOCKER_IMAGE: ${{ steps.resolve.outputs.docker_image }}
+          IMAGE_REPO: ${{ steps.resolve.outputs.image_repo }}
+          SOURCE_DIGEST: ${{ steps.resolve.outputs.source_digest }}
           ENV_TAG: ${{ steps.resolve.outputs.env_tag }}
           BUILD_ID: ${{ inputs.build_id }}
           ENVIRONMENT: ${{ inputs.environment }}
@@ -289,11 +312,21 @@ jobs:
             }
           }
           try {
-            docker pull $env:DOCKER_IMAGE
-            if ($LASTEXITCODE -ne 0) { throw "pull $($env:DOCKER_IMAGE) failed" }
-            docker tag $env:DOCKER_IMAGE $env:ENV_TAG
-            docker push $env:ENV_TAG
-            if ($LASTEXITCODE -ne 0) { throw "push $($env:ENV_TAG) failed" }
+            $source = $env:DOCKER_IMAGE
+            # Imported builds record the digest they were imported at; the
+            # version tag must still point there.
+            if ($env:SOURCE_DIGEST) {
+              $manifest = docker buildx imagetools inspect $env:DOCKER_IMAGE --format '{{json .Manifest}}'
+              if ($LASTEXITCODE -ne 0) { throw "inspect $($env:DOCKER_IMAGE) failed" }
+              $digest = [string](($manifest | Out-String) | ConvertFrom-Json).digest
+              if ($digest -ne $env:SOURCE_DIGEST) {
+                throw "version tag was overwritten: $($env:DOCKER_IMAGE) is $digest, the build was imported as $($env:SOURCE_DIGEST)"
+              }
+              # Copy by digest so a push between the check and the copy can't slip in.
+              $source = "$($env:IMAGE_REPO)@$($env:SOURCE_DIGEST)"
+            }
+            docker buildx imagetools create -t $env:ENV_TAG $source
+            if ($LASTEXITCODE -ne 0) { throw "imagetools create $($env:ENV_TAG) from $source failed" }
           } catch {
             Report-Failed
             throw
