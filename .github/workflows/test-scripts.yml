@@ -1,16 +1,19 @@
 name: Test scripts
 
 # Runs the script tests (resolve-config.sh, check-components.sh,
-# select-changed.sh and publish-release.ps1) whenever the scripts change.
+# select-changed.sh, publish-release.ps1 and the register-build action)
+# whenever they change.
 
 on:
   push:
     paths:
       - "scripts/**"
+      - "register-build/**"
       - ".github/workflows/test-scripts.yml"
   pull_request:
     paths:
       - "scripts/**"
+      - "register-build/**"
       - ".github/workflows/test-scripts.yml"
 
 permissions:
@@ -30,6 +33,9 @@ jobs:
 
       - name: Run script tests
         run: bash scripts/tests/run.sh
+
+      - name: Run register-build tests
+        run: bash scripts/tests/register-build.tests.sh
 
       # pwsh is preinstalled on ubuntu-latest.
       - name: Run publish-release tests
