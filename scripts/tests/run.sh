@@ -78,6 +78,69 @@ run_case ".deploytrack.yaml without components, no Dockerfile: none" 0 "" false 
   "printf 'version: 1\nbranches: [dev, production]\n' > .deploytrack.yaml"
 
 # ---------------------------------------------------------------------------
+# check-components.sh: components DeployTrack marks as external
+
+# ext_case NAME EXPECT_EXIT EXPECT_NAMES EXPECT_EXTERNAL BASELINES SETUP...
+#   EXPECT_NAMES:    buildable component names left, joined with ","
+#   EXPECT_EXTERNAL: the `external` output, as compact JSON ("-" when failing)
+ext_case() {
+  local name="$1" want_exit="$2" want_names="$3" want_ext="$4" baselines="$5"
+  shift 5
+  cases=$((cases + 1))
+  local dir out components got_exit names ext
+  dir="$(mktemp -d)"
+  (cd "$dir" && eval "$*")
+  out="$(cd "$dir" && GITHUB_OUTPUT='' bash "$SCRIPTS/resolve-config.sh" 2>/dev/null)"
+  components="$(sed -n 's/^components=//p' <<<"$out")"
+  out="$(cd "$dir" && GITHUB_OUTPUT='' BASELINES="$baselines" bash "$SCRIPTS/check-components.sh" "$components" 2>&1)"
+  got_exit=$?
+  names="$(sed -n 's/^components=//p' <<<"$out" | jq -r 'map(.name) | join(",")' 2>/dev/null)"
+  ext="$(sed -n 's/^external=//p' <<<"$out")"
+  rm -rf "$dir"
+  if [[ "$got_exit" == "$want_exit" && ( "$want_exit" != 0 || ( "$names" == "$want_names" && "$ext" == "$want_ext" ) ) ]]; then
+    echo "ok   $name"
+  else
+    failures=$((failures + 1))
+    echo "FAIL $name: exit=$got_exit (want $want_exit) names='$names' (want '$want_names') external='$ext' (want '$want_ext')"
+    sed 's/^/     | /' <<<"$out"
+  fi
+}
+
+API_WEB_COMPOSE="mkdir api web && echo 'FROM scratch' > web/Dockerfile && printf 'services:
+  api:
+    build: ./api
+  web:
+    build: ./web
+' > compose.yaml"
+API_EXTERNAL='{"components":{"api":{"commit_sha":"","version_requested":false,"build_mode":"external"},"web":{"build_id":3,"commit_sha":"abc","version_requested":false,"build_mode":"managed"}}}'
+
+ext_case "external component without a Dockerfile is skipped, not an error" 0 "web" '["api"]' "$API_EXTERNAL"   "$API_WEB_COMPOSE"
+
+ext_case "only external components: nothing to build" 0 "" '["api"]'   '{"components":{"api":{"build_mode":"external"}}}'   "mkdir api && printf 'version: 1
+components:
+  - name: api
+    path: ./api
+' > .deploytrack.yaml"
+
+ext_case "external name matches case-insensitively" 0 "web" '["api"]'   '{"components":{"API":{"build_mode":"external"}}}'   "$API_WEB_COMPOSE"
+
+ext_case "no build_mode field means managed: missing Dockerfile still fails" 1 - -   '{"components":{"api":{"commit_sha":"","version_requested":false}}}'   "$API_WEB_COMPOSE"
+
+ext_case "empty BASELINES: old behaviour, missing Dockerfile fails" 1 - - ""   "$API_WEB_COMPOSE"
+
+ext_case "invalid BASELINES: nothing is external" 0 "web" '[]' "not json"   "mkdir web && echo 'FROM scratch' > web/Dockerfile && printf 'services:
+  web:
+    build: ./web
+' > compose.yaml"
+
+ext_case "managed components are kept" 0 "api,web" '[]'   '{"components":{"api":{"build_mode":"managed"},"web":{"build_mode":"managed"}}}'   "mkdir api web && echo 'FROM scratch' > api/Dockerfile && echo 'FROM scratch' > web/Dockerfile && printf 'services:
+  api:
+    build: ./api
+  web:
+    build: ./web
+' > compose.yaml"
+
+# ---------------------------------------------------------------------------
 # resolve-config.sh: the build: block (shared_changes, ignore)
 
 # cfg_case NAME EXPECT_EXIT EXPECT_SHARED EXPECT_IGNORE SETUP...
@@ -144,7 +207,7 @@ sel_case() {
   cases=$((cases + 1))
   local dir out build skip
   dir="$(mktemp -d)"
-  out="$(cd "$dir" && unset BASELINES FORCE SHARED_CHANGES && eval "$*" >/dev/null &&
+  out="$(cd "$dir" && unset BASELINES FORCE SHARED_CHANGES EXTERNAL && eval "$*" >/dev/null &&
     GITHUB_OUTPUT='' GITHUB_STEP_SUMMARY='' bash "$SCRIPTS/select-changed.sh" 2>&1)"
   build="$(sed -n 's/^components=//p' <<<"$out" | jq -r 'map(.name) | join(",")' 2>/dev/null)"
   skip="$(sed -n 's/^skipped=//p' <<<"$out" | jq -r 'map(.name) | join(",")' 2>/dev/null)"
@@ -205,6 +268,43 @@ sel_case "root component builds on any non-ignored change" app "" \
 
 sel_case "root component skips ignored-only changes" "" app \
   "two_components && export COMPONENTS='[{\"name\":\"app\",\"path\":\".\"}]' && baselines_for app && echo x >README.md && commit c"
+
+# External components (EXTERNAL from check-components.sh, which already dropped
+# them from COMPONENTS) are listed as skipped and never built, even when forced.
+api_external() {
+  two_components && baselines_for web
+  export BASELINES=$(jq -c '.components.api = {commit_sha: "", version_requested: false, build_mode: "external"}' <<<"$BASELINES")
+  export COMPONENTS='[{"name":"web","path":"./web/"}]' EXTERNAL='["api"]'
+}
+
+sel_case "mixed repo: external api skipped, changed web builds" web api   "api_external && echo x >>web/index && echo x >>api/main && commit c"
+
+sel_case "force all keeps the external component skipped" web api   "api_external && export FORCE=all"
+
+sel_case "forcing an external component by name keeps it skipped" "" web,api   "api_external && export FORCE=api"
+
+sel_case "external component still in COMPONENTS is not built" web api   "api_external && export COMPONENTS='[{\"name\":\"api\",\"path\":\"api\"},{\"name\":\"web\",\"path\":\"./web/\"}]' FORCE=all"
+
+sel_case "invalid EXTERNAL fails" "" ""   "api_external && export EXTERNAL=api"
+
+# Reason and warning text for an external component.
+cases=$((cases + 1))
+dir="$(mktemp -d)"
+summary="$dir/summary.md"
+out="$(cd "$dir" && unset FORCE SHARED_CHANGES && api_external >/dev/null && export FORCE=api &&
+  GITHUB_OUTPUT='' GITHUB_STEP_SUMMARY="$summary" bash "$SCRIPTS/select-changed.sh" 2>&1)"
+reason="$(sed -n 's/^skipped=//p' <<<"$out" | jq -r '.[] | select(.name == "api") | .reason' 2>/dev/null)"
+if [[ "$reason" == "external build (imported, not built here)" ]] &&
+  grep -q "^::warning::Component 'api' builds externally" <<<"$out" &&
+  grep -qF '| api | no | external build (imported, not built here) |' "$summary"; then
+  echo "ok   external component: skip reason, summary row and force warning"
+else
+  failures=$((failures + 1))
+  echo "FAIL external component: skip reason, summary row and force warning (reason='$reason')"
+  sed 's/^/     | /' <<<"$out"
+  [[ -f "$summary" ]] && sed 's/^/     S /' "$summary"
+fi
+rm -rf "$dir"
 
 echo
 echo "$((cases - failures))/$cases passed"

@@ -150,6 +150,7 @@ Do not combine `infer: true` with a component list. If both appear, `infer: true
 
 - **A declared component without its Dockerfile fails the whole run.** This applies to components from `.deploytrack.yaml` and from Compose `build:` services. Every missing file is reported as an error, nothing is allocated in DeployTrack, and no component is built until it is fixed.
 - **No components is a success.** The run ends green with a summary saying there is nothing to build, and the `build` job is skipped.
+- **External components are skipped.** A component whose `build_mode` is `external` in the baselines response is built outside DeployTrack CI and its images are imported, so `check-components.sh` drops it before the Dockerfile check (it may have no Dockerfile at all) and prints a notice. `select-changed.sh` never selects it, not even with `build: all` or by name (naming it logs a warning), and lists it in the run summary as `external build (imported, not built here)`. A component missing from the response, or without `build_mode`, is managed. If the baselines call fails, nothing is known to be external and every component builds as before; an external component then fails at allocation with DeployTrack's "builds externally" error.
 
 Then `scripts/select-changed.sh` keeps only the components that need a build. It compares `git diff <baseline> HEAD`, minus `build.ignore`, with each component's `path`. A component builds when any of these is true:
 

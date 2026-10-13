@@ -6,6 +6,10 @@
 #   BASELINES       JSON from DeployTrack GET /api/projects/{id}/build-baselines:
 #                   {"components": {"<name>": {"commit_sha": "...", "version_requested": bool}}}
 #                   Empty when it could not be fetched: everything builds.
+#   EXTERNAL        JSON array of component names DeployTrack marks as external
+#                   (from check-components.sh). They are built elsewhere and
+#                   imported, so they are never selected, even when forced, and
+#                   are listed as skipped. Default [].
 #   FORCE           "" (changed only), "all", or a comma list of component names
 #   SHARED_CHANGES  "all" (default): a change outside every component folder
 #                   rebuilds every component; "none": it builds nothing
@@ -30,6 +34,8 @@ baselines="${BASELINES:-}"
 force="$(printf '%s' "${FORCE:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
 shared_changes="$(printf '%s' "${SHARED_CHANGES:-all}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
 ignore="${IGNORE:-[]}"
+external="${EXTERNAL:-}"
+[[ -n "$external" ]] || external='[]'
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required" >&2
@@ -51,6 +57,11 @@ if ! jq -e 'type == "array"' <<<"$ignore" >/dev/null 2>&1; then
   echo "build.ignore must be a list of path patterns (got $ignore)" >&2
   exit 2
 fi
+if ! jq -e 'type == "array"' <<<"$external" >/dev/null 2>&1; then
+  echo "EXTERNAL is not a JSON array: $external" >&2
+  exit 2
+fi
+external="$(jq -c 'map(ascii_downcase)' <<<"$external")"
 if [[ -n "$baselines" ]] && ! jq -e '.components | type == "object"' <<<"$baselines" >/dev/null 2>&1; then
   echo "::warning::Build baselines are not valid JSON; building every component."
   baselines=""
@@ -106,6 +117,10 @@ is_shared() {
   return 0
 }
 
+is_external() {
+  jq -e --arg n "$1" 'any(. == $n)' <<<"$external" >/dev/null
+}
+
 forced() {
   local name="$1"
   [[ "$force" == "all" ]] && return 0
@@ -126,6 +141,9 @@ for ((i = 0; i < count; i++)); do
   c="$(jq -c ".[$i]" <<<"$components")"
   name="$(jq -r '.name' <<<"$c" | tr '[:upper:]' '[:lower:]')"
   folder="$(folder_of "$(jq -r '.path // "."' <<<"$c")")"
+
+  # check-components.sh already drops these; skip them here too in case.
+  is_external "$name" && continue
 
   reason=""
   if forced "$name"; then
@@ -169,6 +187,15 @@ for ((i = 0; i < count; i++)); do
   selected="$(jq -c --argjson c "$c" '. + [$c]' <<<"$selected")"
   add built "$c" "$reason"
 done
+
+external_reason="external build (imported, not built here)"
+while IFS= read -r name; do
+  [[ -z "$name" ]] && continue
+  if [[ "$force" != "all" ]] && forced "$name"; then
+    echo "::warning::Component '$name' builds externally, so it cannot be forced here; import its images instead."
+  fi
+  add skipped "$(jq -nc --arg n "$name" '{name: $n}')" "$external_reason"
+done < <(jq -r '.[]' <<<"$external")
 
 has_components=false
 if [[ "$(jq 'length' <<<"$selected")" -gt 0 ]]; then

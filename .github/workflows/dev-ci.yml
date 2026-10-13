@@ -153,6 +153,8 @@ jobs:
         id: check
         env:
           COMPONENTS: ${{ steps.parse.outputs.components }}
+          # Components DeployTrack marks as external are skipped, not checked.
+          BASELINES: ${{ needs.baselines.outputs.json }}
         run: bash "$SCRIPTS/check-components.sh"
 
       - name: Select changed components
@@ -160,6 +162,7 @@ jobs:
         env:
           COMPONENTS: ${{ steps.check.outputs.components }}
           BASELINES: ${{ needs.baselines.outputs.json }}
+          EXTERNAL: ${{ steps.check.outputs.external }}
           FORCE: ${{ inputs.force_components }}
           SHARED_CHANGES: ${{ steps.parse.outputs.shared_changes }}
           IGNORE: ${{ steps.parse.outputs.ignore }}
