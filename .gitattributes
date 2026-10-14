@@ -1,3 +1,5 @@
 # Scripts also run in Git Bash on Windows runners, whose checkouts default to
 # core.autocrlf=true. Keep them LF so no bash build trips over CRLF.
 *.sh text eol=lf
+# The test fakes are bash scripts without an extension.
+scripts/tests/fakes/* text eol=lf

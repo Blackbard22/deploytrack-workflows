@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Fake docker for register-build.tests.sh: a tiny in-memory registry.
+#   - every call appends its argv (one line, space-joined) to $FAKE_DIR/docker.log
+#     and its DOCKER_CONFIG to $FAKE_DIR/docker.config;
+#   - `login ... --password-stdin` saves stdin to $FAKE_DIR/docker.password
+#     and the DOCKER_CONFIG's config.json to $FAKE_DIR/docker.config.json;
+#   - `buildx imagetools create -t TAG SRC` records TAG -> digest of SRC in
+#     $FAKE_DIR/registry (FAKE_DOCKER_CREATE_DIGEST overrides that digest);
+#     FAKE_DOCKER_FAIL_CREATE=1 makes it fail with an error on stderr;
+#   - `buildx imagetools inspect REF --format '{{json .Manifest}}'` prints the
+#     digest of REF@digest, of a TAG created above, or FAKE_DOCKER_DIGEST for
+#     any other tag (unset: "not found").
+set -uo pipefail
+
+dir="${FAKE_DIR:?FAKE_DIR is not set}"
+echo "$*" >>"$dir/docker.log"
+echo "${DOCKER_CONFIG:-}" >>"$dir/docker.config"
+
+case "$1" in
+  login)
+    cat >"$dir/docker.password"
+    cp "${DOCKER_CONFIG:-/nonexistent}/config.json" "$dir/docker.config.json" 2>/dev/null
+    echo "Login Succeeded"
+    exit 0
+    ;;
+  buildx) ;;
+  *) echo "fake docker: unsupported command $1" >&2; exit 1 ;;
+esac
+
+digest_of() {
+  if [[ "$1" == *@* ]]; then
+    printf '%s' "${1#*@}"
+  elif grep -q "^$1 " "$dir/registry" 2>/dev/null; then
+    grep "^$1 " "$dir/registry" | tail -n 1 | cut -d' ' -f2
+  else
+    printf '%s' "${FAKE_DOCKER_DIGEST:-}"
+  fi
+}
+
+case "$2 $3" in
+  "imagetools create")
+    if [[ "${FAKE_DOCKER_FAIL_CREATE:-}" == 1 ]]; then
+      echo "ERROR: failed to push $5: denied: permission_denied: write_package" >&2
+      exit 1
+    fi
+    [[ "$4" == -t ]] || { echo "fake docker: expected -t" >&2; exit 1; }
+    echo "$5 ${FAKE_DOCKER_CREATE_DIGEST:-$(digest_of "$6")}" >>"$dir/registry"
+    ;;
+  "imagetools inspect")
+    d="$(digest_of "$4")"
+    if [[ -z "$d" ]]; then
+      echo "ERROR: $4: not found" >&2
+      exit 1
+    fi
+    printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","digest":"%s","size":1609}\n' "$d"
+    ;;
+  *) echo "fake docker: unsupported buildx command $2 $3" >&2; exit 1 ;;
+esac

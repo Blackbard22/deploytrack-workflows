@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Fake curl for register-build.tests.sh. Understands the flags
+# register-build.sh passes (-X, -o, -w, -H, --data-binary @-) and:
+#   - records call N as $FAKE_DIR/curl.N.{method,url,args,headers,body};
+#   - answers from $FAKE_DIR/responses/<METHOD><path with / as _>[.<n>].{status,body}
+#     where n counts calls to that key (so a key can fail once, then succeed);
+#     a missing status means 404, status "000" means unreachable (exit 7).
+set -uo pipefail
+
+dir="${FAKE_DIR:?FAKE_DIR is not set}"
+n=$(($(cat "$dir/curl.count" 2>/dev/null || echo 0) + 1))
+echo "$n" >"$dir/curl.count"
+
+method=GET out="" url="" headers=() body=""
+printf '%s\n' "$@" >"$dir/curl.$n.args"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -X) method="$2"; shift 2 ;;
+    -o) out="$2"; shift 2 ;;
+    -w) shift 2 ;;
+    -H)
+      if [[ "$2" == @* ]]; then headers+=("$(cat "${2#@}")"); else headers+=("$2"); fi
+      shift 2 ;;
+    --data-binary) [[ "$2" == @- ]] && body="$(cat)"; shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+printf '%s\n' "$method" >"$dir/curl.$n.method"
+printf '%s\n' "$url" >"$dir/curl.$n.url"
+printf '%s\n' "${headers[@]}" >"$dir/curl.$n.headers"
+printf '%s' "$body" >"$dir/curl.$n.body"
+
+path="/${url#*://*/}"
+key="$method${path//\//_}"
+k=$(($(cat "$dir/count.$key" 2>/dev/null || echo 0) + 1))
+echo "$k" >"$dir/count.$key"
+resp="$dir/responses/$key"
+if [[ -f "$resp.$k.status" ]]; then resp="$resp.$k"; fi
+
+status="$(cat "$resp.status" 2>/dev/null || echo 404)"
+if [[ "$status" == 000 ]]; then
+  echo "curl: (7) Failed to connect" >&2
+  printf '000'
+  exit 7
+fi
+if [[ -n "$out" ]]; then cat "$resp.body" >"$out" 2>/dev/null || : >"$out"; fi
+printf '%s' "$status"

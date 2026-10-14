@@ -1,0 +1,96 @@
+name: DeployTrack — Register build
+description: >-
+  Register an image you built yourself with DeployTrack: DeployTrack allocates
+  the version, the image is retagged to it inside the registry (no pull, no
+  rebuild; multi-arch indexes keep their digest) and the result is reported back.
+  See register-build/README.md.
+
+#   - uses: Blackbard22/deploytrack-workflows/register-build@v1
+#     with:
+#       tracker_url: ${{ vars.TRACKER_URL }}
+#       token: ${{ secrets.CICD_WEBHOOK_SECRET }}
+#       component: backend
+#       image: ghcr.io/org/app@${{ steps.push.outputs.digest }}
+
+inputs:
+  tracker_url:
+    description: DeployTrack API base URL
+    required: true
+  token:
+    description: DeployTrack CI token (the CICD_WEBHOOK_SECRET repo secret)
+    required: true
+  component:
+    description: DeployTrack component name (must be in external build mode). Required unless build_id is set.
+    required: false
+    default: ''
+  image:
+    description: Image you pushed, ideally repo@sha256:<digest>; a repo:tag is resolved to its digest. Required unless build_id is set.
+    required: false
+    default: ''
+  commit_sha:
+    description: Commit the image was built from (ticket links come from the commit range)
+    required: false
+    default: ${{ github.sha }}
+  branch:
+    description: Branch the image was built from
+    required: false
+    default: ${{ github.ref_name }}
+  repository:
+    description: Enrolled repository (owner/repo) that identifies the DeployTrack project
+    required: false
+    default: ${{ github.repository }}
+  project_id:
+    description: DeployTrack project id (optional; must match the repository's project)
+    required: false
+    default: ''
+  registry_username:
+    description: Registry username for the retag
+    required: false
+    default: ${{ github.actor }}
+  registry_token:
+    description: >-
+      Registry password/token for the retag. The default GITHUB_TOKEN needs
+      packages: write; use a PAT for a registry outside the repo's org.
+    required: false
+    default: ${{ github.token }}
+  build_id:
+    description: Retag-only mode (used by promote.yml) - finish the pending import of this DeployTrack build
+    required: false
+    default: ''
+
+outputs:
+  build_id:
+    description: DeployTrack build id
+    value: ${{ steps.register.outputs.build_id }}
+  version:
+    description: Allocated version (e.g. 1.4.0)
+    value: ${{ steps.register.outputs.version }}
+  docker_image:
+    description: DeployTrack's version tag the image now has (repo:<version>-build<N>)
+    value: ${{ steps.register.outputs.docker_image }}
+  digest:
+    description: Image digest (sha256:...)
+    value: ${{ steps.register.outputs.digest }}
+  status:
+    description: built, failed, or (retag-only mode with nothing to do) none / the import's status
+    value: ${{ steps.register.outputs.status }}
+
+runs:
+  using: composite
+  steps:
+    - name: Register build with DeployTrack
+      id: register
+      shell: bash
+      env:
+        TRACKER_URL: ${{ inputs.tracker_url }}
+        TRACKER_TOKEN: ${{ inputs.token }}
+        COMPONENT: ${{ inputs.component }}
+        IMAGE: ${{ inputs.image }}
+        COMMIT_SHA: ${{ inputs.commit_sha }}
+        BRANCH: ${{ inputs.branch }}
+        REPOSITORY: ${{ inputs.repository }}
+        PROJECT_ID: ${{ inputs.project_id }}
+        REGISTRY_USERNAME: ${{ inputs.registry_username }}
+        REGISTRY_TOKEN: ${{ inputs.registry_token }}
+        BUILD_ID: ${{ inputs.build_id }}
+      run: bash "$GITHUB_ACTION_PATH/register-build.sh"

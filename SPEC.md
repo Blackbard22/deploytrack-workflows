@@ -142,7 +142,7 @@ Do not combine `infer: true` with a component list. If both appear, `infer: true
 
 `dev-ci.yml` runs in three stages, all on a `self-hosted` runner. `promote.yml` does the same for its `setup` and `promote` jobs. The workflows only run on self-hosted runners: nothing uses a GitHub-hosted runner, so private repos in an org without hosted-runner minutes still run.
 
-**Runner requirements:** a Windows self-hosted runner with PowerShell, Docker and [Git for Windows](https://gitforwindows.org/). `detect` and promote's `setup` are bash steps, so they run in Git Bash; [`scripts/setup-tools.ps1`](scripts/setup-tools.ps1) puts Git Bash first on `PATH` (ahead of WSL's `System32\bash.exe`) and installs pinned, checksum-verified `jq` and `yq` into the runner tool cache on first use.
+**Runner requirements:** a Windows self-hosted runner with PowerShell, Docker (with the `buildx` plugin, which Docker Desktop ships; promote retags with it) and [Git for Windows](https://gitforwindows.org/). `detect` and promote's `setup` are bash steps, so they run in Git Bash; [`scripts/setup-tools.ps1`](scripts/setup-tools.ps1) puts Git Bash first on `PATH` (ahead of WSL's `System32\bash.exe`) and installs pinned, checksum-verified `jq` and `yq` into the runner tool cache on first use.
 
 **`baselines`** (on the build runner) asks DeployTrack, via `GET /api/projects/{id}/build-baselines`, which commit each component was last built from: its newest build with a successful deploy to the first pipeline stage. If the call fails, every component builds.
 
@@ -179,6 +179,48 @@ Every dev CI failure reaches DeployTrack, which shows it as a notification. Repo
   - Once the dev deployment is recorded as a success, a later failure is not reported, since a failed deployment would contradict it.
 
 `run_url` links to the run attempt (`…/actions/runs/{id}/attempts/{n}`), so DeployTrack can ignore a repeated report for the same attempt.
+
+---
+
+## External builds
+
+A component can be built outside DeployTrack (Buildx or Bake, Bazel, Nix, a vendor build service, another CI system, multi-arch builds). An admin sets its **build mode** to *External build* in the project workspace; the mode is a DeployTrack setting, not a `.deploytrack.yaml` field. Dev CI does not build external components.
+
+The team builds and pushes the image itself, then **imports** it. DeployTrack allocates the version and build number exactly as for a CI build, and the image is retagged **inside the registry** to `repo:<version>-build<N>` with `docker buildx imagetools create` (no pull, no rebuild; a multi-arch manifest list keeps its digest). DeployTrack stores the image's digest on the build. Once the retag succeeds the build counts as deployed to the first pipeline stage, so it promotes and links tickets like any other build.
+
+Two ways to import:
+
+- **From a workflow:** the [`register-build`](register-build/README.md) action, one step after the push. It retags with the job's `GITHUB_TOKEN` and writes the version to the job summary.
+  ```yaml
+  - uses: Blackbard22/deploytrack-workflows/register-build@v1
+    with:
+      tracker_url: ${{ vars.TRACKER_URL }}
+      token: ${{ secrets.CICD_WEBHOOK_SECRET }}
+      component: backend
+      image: ghcr.io/org/app-backend@${{ steps.push.outputs.digest }}
+  ```
+- **From the DeployTrack UI:** paste the image reference. DeployTrack dispatches the repo's `promote.yml` caller with `environment` set to the first stage, and the reusable `promote.yml` runs its `import` job: the same action in retag-only mode (`build_id`), which retags the pending import and reports back. For a build that is not a pending import, that job does nothing.
+
+Importing the same digest and commit again returns the existing build. A failed import is retried by importing again; it keeps its version.
+
+**Rules for users**
+
+- Push to the component's own image repository. DeployTrack refuses images from any other repository and retags inside that one.
+- The commit must be the one the image was built from: ticket links come from the commit range. It is required.
+- Don't push DeployTrack's version tags (`1.4.0-build2`) or environment tags (`dev`, `staging`, …) yourself. They are refused as import input; pass the digest of your own push.
+
+**One-time setup:** the repo is enrolled through the GitHub App (it has the `CICD_WEBHOOK_SECRET` secret); the component is set to external, with its image repository; the importing workflow grants `packages: write` to `GITHUB_TOKEN`, or passes a PAT as `registry_token` for a registry outside the repo's org.
+
+---
+
+## Promote failures
+
+Every failed promote reaches DeployTrack, which shows it as a notification and stops waiting on the dispatch. Reports are best effort: if one cannot be sent (tracker down, old tracker without the endpoint), the run logs a warning and the original failure stays the one shown. `run_url` links to the run attempt (`…/actions/runs/{id}/attempts/{n}`).
+
+- **`setup` failed** (e.g. a broken `.deploytrack.yaml`): the `report-setup-failure` job posts `POST /api/deployments` with `status: failed` and `stage: promote_setup`. If DeployTrack answers 422 (e.g. an environment it doesn't know), it posts `POST /api/projects/{id}/ci-failures` (a `CI_FAILED` event) instead.
+- **Before the promote is recorded** (resolve, GHCR login, retag or the record call failed): one `Report failed promote` step at the end of the `promote` job posts `POST /api/deployments` with `status: failed`, `stage` (`resolve`, `login`, `retag` or `promote`), the step's error as `error`, and `run_url` (a `DEPLOYMENT_FAILED` event). A 422 falls back to `/ci-failures` as above.
+- **After the promote is recorded** (checking out the repo or syncing the environment branch failed): the image is retagged and the deploy recorded as a success, so a failed deployment would contradict it. The same step posts `/ci-failures` with `stage: git_sync`, which DeployTrack shows as a warning.
+- A Releases error is never reported (see below). A target missing from `branches` is a no-op, not a failure; DeployTrack flags such a dispatch as stalled when nothing reports back.
 
 ---
 
@@ -255,6 +297,6 @@ So `[dev, staging, production]` defaults to `dev: qa`, `staging: client`, and `[
 
 ## Implementation status
 
-App and [`scripts/resolve-config.sh`](scripts/resolve-config.sh) implement Compose inference from the first repo-root Compose file (`docker-compose.yml` → `docker-compose.yaml` → `compose.yml` → `compose.yaml`). Missing yaml, empty or omitted components, and `components.infer: true` expand to the same explicit list (or the `app` fallback when `./Dockerfile` exists, else no components). [`scripts/check-components.sh`](scripts/check-components.sh) is the `detect` job's Dockerfile check; [`scripts/select-changed.sh`](scripts/select-changed.sh) picks the components that changed, and [`scripts/report-ci-failure.sh`](scripts/report-ci-failure.sh) reports a failure before allocation. All four are covered by `scripts/tests/run.sh`, and [`scripts/publish-release.ps1`](scripts/publish-release.ps1) (production GitHub Releases) by `scripts/tests/publish-release.tests.ps1`; `test-scripts.yml` runs both on changes. App org defaults are `["dev", "production"]`. Reusable [`promote.yml`](.github/workflows/promote.yml) retags one `build_id` to an `environment` input; a missing or CI-only (index 0) target in `branches` is a no-op. Enrollment writes a thin `workflow_dispatch` caller so `trigger-promote` can dispatch it.
+App and [`scripts/resolve-config.sh`](scripts/resolve-config.sh) implement Compose inference from the first repo-root Compose file (`docker-compose.yml` → `docker-compose.yaml` → `compose.yml` → `compose.yaml`). Missing yaml, empty or omitted components, and `components.infer: true` expand to the same explicit list (or the `app` fallback when `./Dockerfile` exists, else no components). [`scripts/check-components.sh`](scripts/check-components.sh) is the `detect` job's Dockerfile check; [`scripts/select-changed.sh`](scripts/select-changed.sh) picks the components that changed, and [`scripts/report-ci-failure.sh`](scripts/report-ci-failure.sh) reports a failure before allocation. All four are covered by `scripts/tests/run.sh`, and [`scripts/publish-release.ps1`](scripts/publish-release.ps1) (production GitHub Releases) by `scripts/tests/publish-release.tests.ps1`; `test-scripts.yml` runs both on changes. App org defaults are `["dev", "production"]`. Reusable [`promote.yml`](.github/workflows/promote.yml) retags one `build_id` to an `environment` input inside the registry (`docker buildx imagetools create`, so a multi-arch image keeps every platform and its digest; an imported build is first checked against its recorded digest and the promote fails if its version tag was overwritten); a target missing from `branches` is a no-op, and the CI-only (index 0) target only finishes a pending import (the `import` job) and is otherwise a no-op. The [`register-build`](register-build/action.yml) action is covered by `scripts/tests/register-build.tests.sh`. Enrollment writes a thin `workflow_dispatch` caller so `trigger-promote` can dispatch it.
 
 The App resolves `approvals` into per-stage gates (`ResolveEnvironments`) and sends them to the tracker as `environments` in `RegisterProject`; the tracker removes environments that are no longer listed. `SyncConfigJob` re-registers on pushes to the default branch that touch `.deploytrack.yaml`. `resolve-config.sh` and the reusable workflows ignore `approvals`; gates are enforced by the tracker when a promote is triggered or recorded.
