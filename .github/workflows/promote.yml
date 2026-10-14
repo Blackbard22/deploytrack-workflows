@@ -208,6 +208,7 @@ jobs:
           ENVIRONMENT: ${{ inputs.environment }}
         run: |
           $ErrorActionPreference = 'Stop'
+          trap { [System.IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP 'deploytrack-error.txt'), "$_"); break }
           $utf8 = New-Object System.Text.UTF8Encoding $false
           if (-not $env:BUILD_ID) { throw 'build_id input is required' }
           if (-not $env:ENVIRONMENT) { throw 'environment input is required' }
@@ -242,11 +243,13 @@ jobs:
           Write-Host "Promote build $($env:BUILD_ID) component=$($build.component) $dockerImage -> $envTag"
 
       - name: Login to GHCR
+        id: login
         env:
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
+          trap { [System.IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP 'deploytrack-error.txt'), "$_"); break }
           $utf8 = New-Object System.Text.UTF8Encoding $false
           $user = [string]$env:GHCR_USERNAME
           $token = [string]$env:GHCR_TOKEN
@@ -290,47 +293,24 @@ jobs:
           IMAGE_REPO: ${{ steps.resolve.outputs.image_repo }}
           SOURCE_DIGEST: ${{ steps.resolve.outputs.source_digest }}
           ENV_TAG: ${{ steps.resolve.outputs.env_tag }}
-          BUILD_ID: ${{ inputs.build_id }}
-          ENVIRONMENT: ${{ inputs.environment }}
-          TRACKER_URL: ${{ inputs.tracker_url }}
-          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
         run: |
           $ErrorActionPreference = 'Stop'
-          function Report-Failed {
-            $headers = @{ 'Content-Type' = 'application/json' }
-            if ($env:TRACKER_TOKEN) { $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)" }
-            $body = @{
-              build_id    = [int]$env:BUILD_ID
-              environment = $env:ENVIRONMENT.Trim().ToLowerInvariant()
-              status      = 'failed'
-              deployed_by = 'github-actions'
-            } | ConvertTo-Json -Compress
-            try {
-              Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)/api/deployments" -Headers $headers -Body $body | Out-Null
-            } catch {
-              Write-Warning "Failed to report failed $($env:ENVIRONMENT) deploy: $_"
+          trap { [System.IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP 'deploytrack-error.txt'), "$_"); break }
+          $source = $env:DOCKER_IMAGE
+          # Imported builds record the digest they were imported at; the
+          # version tag must still point there.
+          if ($env:SOURCE_DIGEST) {
+            $manifest = docker buildx imagetools inspect $env:DOCKER_IMAGE --format '{{json .Manifest}}'
+            if ($LASTEXITCODE -ne 0) { throw "inspect $($env:DOCKER_IMAGE) failed" }
+            $digest = [string](($manifest | Out-String) | ConvertFrom-Json).digest
+            if ($digest -ne $env:SOURCE_DIGEST) {
+              throw "version tag was overwritten: $($env:DOCKER_IMAGE) is $digest, the build was imported as $($env:SOURCE_DIGEST)"
             }
+            # Copy by digest so a push between the check and the copy can't slip in.
+            $source = "$($env:IMAGE_REPO)@$($env:SOURCE_DIGEST)"
           }
-          try {
-            $source = $env:DOCKER_IMAGE
-            # Imported builds record the digest they were imported at; the
-            # version tag must still point there.
-            if ($env:SOURCE_DIGEST) {
-              $manifest = docker buildx imagetools inspect $env:DOCKER_IMAGE --format '{{json .Manifest}}'
-              if ($LASTEXITCODE -ne 0) { throw "inspect $($env:DOCKER_IMAGE) failed" }
-              $digest = [string](($manifest | Out-String) | ConvertFrom-Json).digest
-              if ($digest -ne $env:SOURCE_DIGEST) {
-                throw "version tag was overwritten: $($env:DOCKER_IMAGE) is $digest, the build was imported as $($env:SOURCE_DIGEST)"
-              }
-              # Copy by digest so a push between the check and the copy can't slip in.
-              $source = "$($env:IMAGE_REPO)@$($env:SOURCE_DIGEST)"
-            }
-            docker buildx imagetools create -t $env:ENV_TAG $source
-            if ($LASTEXITCODE -ne 0) { throw "imagetools create $($env:ENV_TAG) from $source failed" }
-          } catch {
-            Report-Failed
-            throw
-          }
+          docker buildx imagetools create -t $env:ENV_TAG $source
+          if ($LASTEXITCODE -ne 0) { throw "imagetools create $($env:ENV_TAG) from $source failed" }
 
       - name: Record gated promote
         id: promote
@@ -341,6 +321,7 @@ jobs:
           ENVIRONMENT: ${{ inputs.environment }}
         run: |
           $ErrorActionPreference = 'Stop'
+          trap { [System.IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP 'deploytrack-error.txt'), "$_"); break }
           $utf8 = New-Object System.Text.UTF8Encoding $false
           $envName = $env:ENVIRONMENT.Trim().ToLowerInvariant()
           $body = @{
@@ -360,6 +341,7 @@ jobs:
           [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "status=$($resp.status)" + [Environment]::NewLine, $utf8)
 
       - name: Checkout repository
+        id: checkout_repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -371,6 +353,7 @@ jobs:
           PREDECESSOR: ${{ needs.setup.outputs.predecessor }}
         run: |
           $ErrorActionPreference = 'Stop'
+          trap { [System.IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP 'deploytrack-error.txt'), "$_"); break }
           $utf8 = New-Object System.Text.UTF8Encoding $false
           $envName = $env:ENVIRONMENT.Trim()
           $pred = $env:PREDECESSOR.Trim()
@@ -473,4 +456,140 @@ jobs:
             } else {
               "- **GitHub release:** not published ($($env:RELEASE_OUTCOME)); see the Publish GitHub release step. The promote itself succeeded." | Add-Content -Path $env:GITHUB_STEP_SUMMARY
             }
+          }
+
+      # One report for whichever step failed; each step's trap leaves its
+      # error in deploytrack-error.txt. Best effort: a report that can't be
+      # sent only warns, so the step that failed stays the run's error.
+      - name: Report failed promote
+        if: failure()
+        env:
+          TRACKER_URL: ${{ inputs.tracker_url }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+          PROJECT_ID: ${{ inputs.project_id }}
+          BUILD_ID: ${{ inputs.build_id }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          COMPONENT: ${{ steps.resolve.outputs.component }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+          RESOLVE_OUTCOME: ${{ steps.resolve.outcome }}
+          LOGIN_OUTCOME: ${{ steps.login.outcome }}
+          RETAG_OUTCOME: ${{ steps.retag.outcome }}
+          PROMOTE_OUTCOME: ${{ steps.promote.outcome }}
+          CHECKOUT_OUTCOME: ${{ steps.checkout_repo.outcome }}
+          GIT_SYNC_OUTCOME: ${{ steps.git_sync.outcome }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $errFile = Join-Path $env:RUNNER_TEMP 'deploytrack-error.txt'
+          $err = ''
+          if (Test-Path $errFile) { $err = (Get-Content -Raw -Encoding UTF8 $errFile).Trim() }
+          $envName = ([string]$env:ENVIRONMENT).Trim().ToLowerInvariant()
+          $buildId = 0
+          [void][int]::TryParse(([string]$env:BUILD_ID).Trim(), [ref]$buildId)
+
+          # Returns the HTTP status (0 when nothing answered); never throws.
+          function Send-Report([string]$path, [hashtable]$body) {
+            $headers = @{}
+            if ($env:TRACKER_TOKEN) { $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)" }
+            $json = $body | ConvertTo-Json -Compress
+            try {
+              Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)$path" -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($json)) | Out-Null
+              Write-Host "Reported the failure to DeployTrack ($path)"
+              return 200
+            } catch {
+              $code = 0
+              if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+              Write-Warning "Could not report the failure to DeployTrack ($path, HTTP $code): $_"
+              return $code
+            }
+          }
+          function Send-CiFailure([string]$stage, [string]$message) {
+            if ($message.Length -gt 2000) { $message = $message.Substring(0, 2000) }
+            $body = @{ stage = $stage; environment = $envName; message = $message; run_url = $env:RUN_URL; workflow = 'promote' }
+            if ($buildId -gt 0) { $body.build_id = $buildId }
+            if ($env:COMPONENT) { $body.component = $env:COMPONENT }
+            [void](Send-Report "/api/projects/$(([string]$env:PROJECT_ID).Trim())/ci-failures" $body)
+          }
+
+          if ($env:PROMOTE_OUTCOME -ne 'success') {
+            # Nothing recorded yet: fail the deployment, which also ends the
+            # dispatch DeployTrack is waiting on.
+            $stage = 'promote'
+            $steps = [ordered]@{ resolve = $env:RESOLVE_OUTCOME; login = $env:LOGIN_OUTCOME; retag = $env:RETAG_OUTCOME }
+            foreach ($k in $steps.Keys) { if ($steps[$k] -eq 'failure') { $stage = $k; break } }
+            if ($err.Length -gt 2000) { $err = $err.Substring(0, 2000) }
+            $code = 422
+            if ($buildId -gt 0) {
+              $body = @{ build_id = $buildId; environment = $envName; status = 'failed'; deployed_by = 'github-actions'; stage = $stage; run_url = $env:RUN_URL }
+              if ($err) { $body.error = $err }
+              $code = Send-Report '/api/deployments' $body
+            }
+            # 422: e.g. an environment DeployTrack doesn't know. Still notify.
+            if ($code -eq 422) {
+              if (-not $err) { $err = "Promote to $envName failed at $stage" }
+              Send-CiFailure $stage $err
+            }
+          } else {
+            # The deployment is already recorded as a success; a failed one
+            # would contradict it, so this is a warning about the branch.
+            $what = 'a later step'
+            if ($env:CHECKOUT_OUTCOME -eq 'failure') { $what = 'checking out the repository' }
+            elseif ($env:GIT_SYNC_OUTCOME -eq 'failure') { $what = "syncing the $envName branch" }
+            $message = "Promote to $envName was recorded, but $what failed"
+            if ($err) { $message = "${message}: $err" }
+            Send-CiFailure 'git_sync' $message
+          }
+
+  # setup failed (e.g. a broken .deploytrack.yaml), so no promote job ran:
+  # report it as a failed deployment, which ends the dispatch DeployTrack is
+  # waiting on. Best effort, like the promote job's report.
+  report-setup-failure:
+    needs: setup
+    if: always() && needs.setup.result == 'failure'
+    runs-on: self-hosted
+    permissions: {}
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Report failed promote
+        env:
+          TRACKER_URL: ${{ inputs.tracker_url }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+          PROJECT_ID: ${{ inputs.project_id }}
+          BUILD_ID: ${{ inputs.build_id }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $envName = ([string]$env:ENVIRONMENT).Trim().ToLowerInvariant()
+          $buildId = 0
+          [void][int]::TryParse(([string]$env:BUILD_ID).Trim(), [ref]$buildId)
+          $message = 'The promote workflow failed in setup (check .deploytrack.yaml); nothing was promoted'
+
+          # Returns the HTTP status (0 when nothing answered); never throws.
+          function Send-Report([string]$path, [hashtable]$body) {
+            $headers = @{}
+            if ($env:TRACKER_TOKEN) { $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)" }
+            $json = $body | ConvertTo-Json -Compress
+            try {
+              Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)$path" -Headers $headers -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($json)) | Out-Null
+              Write-Host "Reported the failure to DeployTrack ($path)"
+              return 200
+            } catch {
+              $code = 0
+              if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+              Write-Warning "Could not report the failure to DeployTrack ($path, HTTP $code): $_"
+              return $code
+            }
+          }
+
+          $code = 422
+          if ($buildId -gt 0) {
+            $code = Send-Report '/api/deployments' @{ build_id = $buildId; environment = $envName; status = 'failed'; deployed_by = 'github-actions'; stage = 'promote_setup'; error = $message; run_url = $env:RUN_URL }
+          }
+          # 422: e.g. an environment DeployTrack doesn't know. Still notify.
+          if ($code -eq 422) {
+            $body = @{ stage = 'promote_setup'; environment = $envName; message = $message; run_url = $env:RUN_URL; workflow = 'promote' }
+            if ($buildId -gt 0) { $body.build_id = $buildId }
+            [void](Send-Report "/api/projects/$(([string]$env:PROJECT_ID).Trim())/ci-failures" $body)
           }
