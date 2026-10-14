@@ -19,6 +19,10 @@ name: DeployTrack — Dev CI
 #               none. DeployTrack registers a component the first time it is
 #               built.
 #
+# Every failure is reported to DeployTrack (SPEC.md, "Failure reporting"):
+# report-failure posts a baselines/detect failure to /ci-failures, and each
+# build leg's last step reports its own failure.
+#
 #   jobs:
 #     ci:
 #       uses: Blackbard22/deploytrack-workflows/.github/workflows/dev-ci.yml@v1
@@ -104,17 +108,22 @@ jobs:
       components: ${{ steps.select.outputs.components }}
       has_components: ${{ steps.select.outputs.has_components }}
       branches: ${{ steps.parse.outputs.branches }}
+      # Set when the job fails; report-failure sends them to DeployTrack.
+      failure_stage: ${{ steps.fail.outputs.stage }}
+      failure_message: ${{ steps.fail.outputs.message }}
     defaults:
       run:
         shell: bash
     steps:
       - name: Checkout caller
+        id: checkout
         uses: actions/checkout@v4
         with:
           # select-changed.sh diffs against older commits.
           fetch-depth: 0
 
       - name: Checkout workflows scripts
+        id: checkout_scripts
         if: hashFiles('scripts/resolve-config.sh') == ''
         uses: actions/checkout@v4
         with:
@@ -127,6 +136,7 @@ jobs:
           sparse-checkout-cone-mode: true
 
       - name: Install tools
+        id: tools
         shell: powershell
         run: |
           $script = 'scripts/setup-tools.ps1'
@@ -134,6 +144,7 @@ jobs:
           & (Resolve-Path $script)
 
       - name: Tool versions
+        id: tool_versions
         run: |
           command -v bash jq yq
           jq --version
@@ -147,23 +158,27 @@ jobs:
             SCRIPTS=_deploytrack_workflows/scripts
           fi
           echo "SCRIPTS=$SCRIPTS" >> "$GITHUB_ENV"
-          bash "$SCRIPTS/resolve-config.sh"
+          # The log feeds the failure message; pipefail keeps the exit code.
+          bash "$SCRIPTS/resolve-config.sh" 2>&1 | tee -a "$RUNNER_TEMP/deploytrack-detect.log"
 
       - name: Check Dockerfiles
         id: check
         env:
           COMPONENTS: ${{ steps.parse.outputs.components }}
-        run: bash "$SCRIPTS/check-components.sh"
+          # Components DeployTrack marks as external are skipped, not checked.
+          BASELINES: ${{ needs.baselines.outputs.json }}
+        run: bash "$SCRIPTS/check-components.sh" 2>&1 | tee -a "$RUNNER_TEMP/deploytrack-detect.log"
 
       - name: Select changed components
         id: select
         env:
           COMPONENTS: ${{ steps.check.outputs.components }}
           BASELINES: ${{ needs.baselines.outputs.json }}
+          EXTERNAL: ${{ steps.check.outputs.external }}
           FORCE: ${{ inputs.force_components }}
           SHARED_CHANGES: ${{ steps.parse.outputs.shared_changes }}
           IGNORE: ${{ steps.parse.outputs.ignore }}
-        run: bash "$SCRIPTS/select-changed.sh"
+        run: bash "$SCRIPTS/select-changed.sh" 2>&1 | tee -a "$RUNNER_TEMP/deploytrack-detect.log"
 
       - name: Summary (nothing to build)
         if: steps.check.outputs.has_components != 'true'
@@ -173,6 +188,84 @@ jobs:
             echo "No buildable components yet, so nothing was built."
             echo "Add a root \`Dockerfile\`, a Compose service with \`build:\`, or a component in \`.deploytrack.yaml\`."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Nothing is allocated yet, so there is no build to fail: record which
+      # stage failed and why for the report-failure job.
+      - name: Failure details
+        id: fail
+        if: failure()
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          CHECKOUT_SCRIPTS_OUTCOME: ${{ steps.checkout_scripts.outcome }}
+          TOOLS_OUTCOME: ${{ steps.tools.outcome }}
+          TOOL_VERSIONS_OUTCOME: ${{ steps.tool_versions.outcome }}
+          RESOLVE_OUTCOME: ${{ steps.parse.outcome }}
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          SELECT_OUTCOME: ${{ steps.select.outcome }}
+        run: |
+          script=scripts/report-ci-failure.sh
+          [ -f "$script" ] || script=_deploytrack_workflows/scripts/report-ci-failure.sh
+          if [ -f "$script" ]; then
+            source "$script"
+            stage="$(failure_stage)"
+            message="$(failure_message "$RUNNER_TEMP/deploytrack-detect.log")"
+          else
+            # Without the scripts a checkout step failed.
+            stage=checkout
+            message="Could not check out the repository or the DeployTrack workflow scripts"
+          fi
+          # One line, so it fits a key=value output.
+          message="${message//[$'\r\n']/ }"
+          echo "Failed at $stage: $message"
+          {
+            echo "stage=$stage"
+            echo "message=$message"
+          } >> "$GITHUB_OUTPUT"
+
+  # Reports a baselines or detect failure. Those happen before a build is
+  # allocated, so they go to /ci-failures (CI_FAILED) instead of
+  # /api/deployments; build-job failures are reported by the build job.
+  report-failure:
+    needs: [baselines, detect]
+    if: always() && (needs.baselines.result == 'failure' || needs.detect.result == 'failure')
+    runs-on: self-hosted
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout workflows scripts
+        uses: actions/checkout@v4
+        with:
+          repository: Blackbard22/deploytrack-workflows
+          ref: v1
+          path: _deploytrack_workflows
+          sparse-checkout: |
+            scripts
+          sparse-checkout-cone-mode: true
+
+      - name: Install tools
+        shell: powershell
+        run: '& (Resolve-Path _deploytrack_workflows/scripts/setup-tools.ps1)'
+
+      # Best effort: the script always exits 0 and only warns when the report
+      # cannot be sent.
+      - name: Report CI failure to DeployTrack
+        env:
+          TRACKER_URL: ${{ inputs.tracker_url }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+          PROJECT_ID: ${{ inputs.project_id }}
+          STAGE: ${{ needs.baselines.result == 'failure' && 'baselines' || needs.detect.outputs.failure_stage }}
+          MESSAGE: ${{ needs.baselines.result != 'failure' && needs.detect.outputs.failure_message || '' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          script=_deploytrack_workflows/scripts/report-ci-failure.sh
+          if [ ! -f "$script" ]; then
+            echo "::warning::$script is missing; the CI failure was not reported to DeployTrack."
+            exit 0
+          fi
+          bash "$script"
 
   build:
     needs: detect
@@ -211,6 +304,13 @@ jobs:
           function Add-RunnerEnv([string]$Line) {
             [System.IO.File]::AppendAllText($env:GITHUB_ENV, $Line + [Environment]::NewLine, $utf8)
           }
+          # Read by "Report failure" when this step fails.
+          $errorFile = Join-Path $env:RUNNER_TEMP 'deploytrack-error.txt'
+          Remove-Item -Force $errorFile -ErrorAction SilentlyContinue
+          function Fail([string]$Message) {
+            [System.IO.File]::WriteAllText($errorFile, $Message, $utf8)
+            throw $Message
+          }
 
           $imageRepo = "$($env:IMAGE_REPO_PREFIX)-$($env:COMPONENT_IMAGE_SUFFIX)"
           $body = @{
@@ -226,7 +326,18 @@ jobs:
             $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)"
           }
 
-          $resp = Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)/api/builds" -Headers $headers -Body $body
+          try {
+            $resp = Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)/api/builds" -Headers $headers -Body $body
+          } catch {
+            # DeployTrack answers {"error": "..."}; fall back to the exception text.
+            $err = $_
+            $reason = "$err"
+            try {
+              $parsed = $err.ErrorDetails.Message | ConvertFrom-Json
+              if ($parsed.error) { $reason = [string]$parsed.error }
+            } catch {}
+            Fail "Allocating a $($env:COMPONENT_NAME) build failed: $reason"
+          }
           $resp | ConvertTo-Json -Depth 6
 
           $buildId = [string]$resp.build.id
@@ -236,8 +347,8 @@ jobs:
           if (-not $dockerImage -and $resp.build) {
             $dockerImage = [string]$resp.build.'docker_image'
           }
-          if ([string]::IsNullOrWhiteSpace($buildId)) { throw 'allocate response missing build.id' }
-          if ([string]::IsNullOrWhiteSpace($dockerImage)) { throw 'allocate response missing docker_image' }
+          if ([string]::IsNullOrWhiteSpace($buildId)) { Fail 'allocate response missing build.id' }
+          if ([string]::IsNullOrWhiteSpace($dockerImage)) { Fail 'allocate response missing docker_image' }
 
           Add-RunnerEnv "BUILD_ID=$buildId"
           Add-RunnerEnv "VERSION=$version"
@@ -253,14 +364,20 @@ jobs:
           Write-Host "  docker_image=$dockerImage"
 
       - name: Optional intentional lint failure
+        id: fail_lint
         if: ${{ inputs.fail_lint == true }}
         run: |
-          Write-Error "Intentional lint failure (fail_lint=true)"
+          $utf8 = New-Object System.Text.UTF8Encoding $false
+          $msg = 'Intentional lint failure (fail_lint=true)'
+          [System.IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP 'deploytrack-error.txt'), $msg, $utf8)
+          Write-Error $msg
           exit 1
 
       - name: Run repo lint scripts
+        id: lint
         run: |
           $ErrorActionPreference = 'Stop'
+          $utf8 = New-Object System.Text.UTF8Encoding $false
           $lintDir = Join-Path $PWD 'ci/lint'
           $scripts = @()
           if (Test-Path $lintDir) {
@@ -272,37 +389,18 @@ jobs:
             foreach ($script in $scripts) {
               Write-Host ('=== Running ' + $script.Name + ' ===')
               & $script.FullName
-              if ($LASTEXITCODE -ne 0) { throw ('Lint failed: ' + $script.Name) }
+              if ($LASTEXITCODE -ne 0) {
+                $msg = 'Lint failed: ' + $script.Name
+                [System.IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP 'deploytrack-error.txt'), $msg, $utf8)
+                throw $msg
+              }
             }
           } else {
             Write-Host 'ci/lint empty or missing — skipping lint'
           }
 
-      - name: Report failed dev deployment (lint)
-        if: failure() && steps.allocate.outcome == 'success'
-        env:
-          TRACKER_URL: ${{ inputs.tracker_url }}
-          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if (-not $env:BUILD_ID) { throw 'BUILD_ID missing after allocate' }
-          $headers = @{ 'Content-Type' = 'application/json' }
-          if ($env:TRACKER_TOKEN) {
-            $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)"
-          }
-          $failBody = @{
-            build_id    = [int]$env:BUILD_ID
-            environment = 'dev'
-            status      = 'failed'
-            deployed_by = 'github-actions'
-          } | ConvertTo-Json -Compress
-          try {
-            Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)/api/deployments" -Headers $headers -Body $failBody | Out-Null
-          } catch {
-            Write-Warning "Failed to report failed lint deploy: $_"
-          }
-
       - name: Login to GHCR
+        id: login
         env:
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -332,8 +430,6 @@ jobs:
       - name: Build and push image
         id: push
         env:
-          TRACKER_URL: ${{ inputs.tracker_url }}
-          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
           COMPONENT_NAME: ${{ matrix.component.name }}
           COMPONENT_PATH: ${{ matrix.component.path }}
           COMPONENT_DOCKERFILE: ${{ matrix.component.dockerfile }}
@@ -342,35 +438,26 @@ jobs:
           if (-not $env:BUILD_ID) { throw 'BUILD_ID is empty after allocate' }
           if (-not $env:DOCKER_IMAGE) { throw 'DOCKER_IMAGE is empty after allocate' }
 
-          $context = $env:COMPONENT_PATH
-          $dockerfile = Join-Path $context $env:COMPONENT_DOCKERFILE
-          if (-not (Test-Path $context)) { throw "build context not found: $context" }
-          if (-not (Test-Path $dockerfile)) { throw "Dockerfile not found: $dockerfile" }
-
-          Write-Host "Building $($env:COMPONENT_NAME) image $($env:DOCKER_IMAGE) from $context (dockerfile=$dockerfile) for build_id=$($env:BUILD_ID)"
           try {
+            $context = $env:COMPONENT_PATH
+            $dockerfile = Join-Path $context $env:COMPONENT_DOCKERFILE
+            if (-not (Test-Path $context)) { throw "build context not found: $context" }
+            if (-not (Test-Path $dockerfile)) { throw "Dockerfile not found: $dockerfile" }
+
+            Write-Host "Building $($env:COMPONENT_NAME) image $($env:DOCKER_IMAGE) from $context (dockerfile=$dockerfile) for build_id=$($env:BUILD_ID)"
             docker build -f $dockerfile -t "$env:DOCKER_IMAGE" $context
             if ($LASTEXITCODE -ne 0) { throw "$($env:COMPONENT_NAME) docker build failed" }
             docker push "$env:DOCKER_IMAGE"
             if ($LASTEXITCODE -ne 0) { throw "$($env:COMPONENT_NAME) docker push failed" }
           } catch {
-            $headers = @{ 'Content-Type' = 'application/json' }
-            if ($env:TRACKER_TOKEN) { $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)" }
-            $failBody = @{
-              build_id    = [int]$env:BUILD_ID
-              environment = 'dev'
-              status      = 'failed'
-              deployed_by = 'github-actions'
-            } | ConvertTo-Json -Compress
-            try {
-              Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)/api/deployments" -Headers $headers -Body $failBody | Out-Null
-            } catch {
-              Write-Warning "Failed to report failed deploy: $_"
-            }
+            # "Report failure" sends this to DeployTrack.
+            $utf8 = New-Object System.Text.UTF8Encoding $false
+            [System.IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP 'deploytrack-error.txt'), "$_", $utf8)
             throw
           }
 
       - name: Record successful dev deployment
+        id: record
         env:
           TRACKER_URL: ${{ inputs.tracker_url }}
           TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
@@ -405,3 +492,88 @@ jobs:
           - **build_id:** $env:BUILD_ID
           - **deployment_id:** $env:DEPLOYMENT_ID
           "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+      # One report for any failed step. With a build allocated it is a failed
+      # dev deployment (BUILD_FAILED); before that there is no build, so it
+      # goes to /ci-failures (CI_FAILED). Best effort: a report never fails
+      # the step, so the real failure stays the one shown.
+      - name: Report failure
+        if: failure()
+        env:
+          TRACKER_URL: ${{ inputs.tracker_url }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+          PROJECT_ID: ${{ inputs.project_id }}
+          COMPONENT_NAME: ${{ matrix.component.name }}
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+          ALLOCATE_OUTCOME: ${{ steps.allocate.outcome }}
+          FAIL_LINT_OUTCOME: ${{ steps.fail_lint.outcome }}
+          LINT_OUTCOME: ${{ steps.lint.outcome }}
+          LOGIN_OUTCOME: ${{ steps.login.outcome }}
+          PUSH_OUTCOME: ${{ steps.push.outcome }}
+          RECORD_OUTCOME: ${{ steps.record.outcome }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try {
+            if (-not $env:TRACKER_URL) {
+              Write-Host '::warning::TRACKER_URL is not set; the failure was not reported to DeployTrack.'
+              exit 0
+            }
+            if ($env:RECORD_OUTCOME -eq 'success') {
+              # The deployment is already recorded as a success; a failed one would contradict it.
+              Write-Host 'The dev deployment was recorded; a later step failed, so nothing is reported.'
+              exit 0
+            }
+
+            $message = ''
+            $errorFile = Join-Path $env:RUNNER_TEMP 'deploytrack-error.txt'
+            if (Test-Path $errorFile) { $message = ([System.IO.File]::ReadAllText($errorFile)).Trim() }
+            $runUrl = ''
+            if ($env:RUN_URL -like 'https://*') { $runUrl = $env:RUN_URL }
+
+            if ($env:ALLOCATE_OUTCOME -eq 'success') {
+              $stage = 'build'
+              if ($env:FAIL_LINT_OUTCOME -eq 'failure' -or $env:LINT_OUTCOME -eq 'failure') { $stage = 'lint' }
+              elseif ($env:LOGIN_OUTCOME -eq 'failure') { $stage = 'login' }
+              elseif ($env:RECORD_OUTCOME -eq 'failure') { $stage = 'record' }
+              if (-not $message) { $message = "Dev CI failed at $stage" }
+              if ($message.Length -gt 2000) { $message = $message.Substring(0, 2000) }
+              $uri = "$($env:TRACKER_URL.TrimEnd('/'))/api/deployments"
+              $body = [ordered]@{
+                build_id    = [int]$env:BUILD_ID
+                environment = 'dev'
+                status      = 'failed'
+                deployed_by = 'github-actions'
+                stage       = $stage
+                error       = $message
+              }
+            } else {
+              # Allocation failed, or the job failed before it (checkout).
+              $stage = 'checkout'
+              if ($env:ALLOCATE_OUTCOME -eq 'failure') { $stage = 'allocate' }
+              if (-not $message) { $message = "Dev CI failed at $stage" }
+              if ($message.Length -gt 2000) { $message = $message.Substring(0, 2000) }
+              $uri = "$($env:TRACKER_URL.TrimEnd('/'))/api/projects/$($env:PROJECT_ID)/ci-failures"
+              $body = [ordered]@{
+                stage      = $stage
+                component  = $env:COMPONENT_NAME
+                message    = $message
+                commit_sha = $env:COMMIT_SHA
+                branch     = $env:BRANCH
+                workflow   = 'dev-ci'
+              }
+            }
+            if ($runUrl) { $body['run_url'] = $runUrl }
+
+            $headers = @{}
+            if ($env:TRACKER_TOKEN) { $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)" }
+            # Send UTF-8 bytes: Windows PowerShell encodes a string body as Latin-1.
+            $json = $body | ConvertTo-Json -Compress
+            Invoke-RestMethod -Method POST -Uri $uri -Headers $headers -ContentType 'application/json; charset=utf-8' `
+              -Body ([System.Text.Encoding]::UTF8.GetBytes($json)) | Out-Null
+            Write-Host "Reported the failure to DeployTrack (stage $stage)."
+          } catch {
+            Write-Host "::warning::Could not report the failure to DeployTrack: $_"
+          }
+          exit 0
