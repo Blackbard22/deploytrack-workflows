@@ -200,6 +200,17 @@ Importing the same digest and commit again returns the existing build. A failed 
 
 ---
 
+## Promote failures
+
+Every failed promote reaches DeployTrack, which shows it as a notification and stops waiting on the dispatch. Reports are best effort: if one cannot be sent (tracker down, old tracker without the endpoint), the run logs a warning and the original failure stays the one shown. `run_url` links to the run attempt (`…/actions/runs/{id}/attempts/{n}`).
+
+- **`setup` failed** (e.g. a broken `.deploytrack.yaml`): the `report-setup-failure` job posts `POST /api/deployments` with `status: failed` and `stage: promote_setup`. If DeployTrack answers 422 (e.g. an environment it doesn't know), it posts `POST /api/projects/{id}/ci-failures` (a `CI_FAILED` event) instead.
+- **Before the promote is recorded** (resolve, GHCR login, retag or the record call failed): one `Report failed promote` step at the end of the `promote` job posts `POST /api/deployments` with `status: failed`, `stage` (`resolve`, `login`, `retag` or `promote`), the step's error as `error`, and `run_url` (a `DEPLOYMENT_FAILED` event). A 422 falls back to `/ci-failures` as above.
+- **After the promote is recorded** (checking out the repo or syncing the environment branch failed): the image is retagged and the deploy recorded as a success, so a failed deployment would contradict it. The same step posts `/ci-failures` with `stage: git_sync`, which DeployTrack shows as a warning.
+- A Releases error is never reported (see below). A target missing from `branches` is a no-op, not a failure; DeployTrack flags such a dispatch as stalled when nothing reports back.
+
+---
+
 ## Production releases
 
 When `promote.yml` promotes a build to the **last** entry in `branches` (production), it also publishes a GitHub Release, so the repo's Releases page always shows what production runs (`scripts/publish-release.ps1`).
