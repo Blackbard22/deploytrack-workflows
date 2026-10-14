@@ -9,8 +9,14 @@
 # .deploytrack.yaml or Compose without its Dockerfile is a broken config,
 # so nothing is built until it is fixed.
 #
-# Writes `components` and `has_components` (true|false) to GITHUB_OUTPUT when
-# set; always prints them. An empty list is not an error: the repo simply has
+# Components DeployTrack marks as external (build_mode "external" in
+# BASELINES, the JSON from GET /api/projects/{id}/build-baselines) are built
+# elsewhere and imported, so they are dropped before the check: they may have
+# no Dockerfile at all. Empty or invalid BASELINES drops nothing.
+#
+# Writes `components` (buildable ones), `has_components` (true|false) and
+# `external` (JSON array of the dropped names) to GITHUB_OUTPUT when set;
+# always prints them. An empty list is not an error: the repo simply has
 # nothing to build yet.
 
 set -euo pipefail
@@ -24,10 +30,21 @@ if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required" >&2
   exit 2
 fi
-if ! count="$(jq -e 'if type == "array" then length else error("not an array") end' <<<"$components" 2>/dev/null)"; then
+if ! jq -e 'type == "array"' <<<"$components" >/dev/null 2>&1; then
   echo "components is not a JSON array: $components" >&2
   exit 2
 fi
+
+external='[]'
+if [[ -n "${BASELINES:-}" ]]; then
+  external="$(jq -c '[(.components // {}) | to_entries[] | select(.value.build_mode == "external") | .key | ascii_downcase]' <<<"$BASELINES" 2>/dev/null)" || external='[]'
+  [[ -n "$external" ]] || external='[]'
+fi
+while IFS= read -r name; do
+  echo "::notice::Component '$name' builds externally; skipped (import its images instead)"
+done < <(jq -r --argjson ext "$external" '.[] | select((.name | ascii_downcase) as $n | $ext | any(. == $n)) | .name' <<<"$components")
+components="$(jq -c --argjson ext "$external" 'map(select((.name | ascii_downcase) as $n | $ext | any(. == $n) | not))' <<<"$components")"
+count="$(jq 'length' <<<"$components")"
 
 missing=0
 while IFS=$'\t' read -r name path dockerfile; do
@@ -58,6 +75,7 @@ fi
 compact="$(jq -c '.' <<<"$components")"
 echo "components=$compact"
 echo "has_components=$has_components"
+echo "external=$external"
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   {
@@ -65,5 +83,6 @@ if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
     echo "$compact"
     echo "EOF"
     echo "has_components=$has_components"
+    echo "external=$external"
   } >> "$GITHUB_OUTPUT"
 fi
